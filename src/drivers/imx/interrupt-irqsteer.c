@@ -333,6 +333,16 @@ static inline void irq_handler(void *data, uint32_t line_index)
 
 	status = get_irqsteer_interrupts(line_index);
 
+	/* Debug trace: IRQ entry + status + line_index */
+	{
+		volatile uint32_t *_tb = (volatile uint32_t *)0x92C02780;
+		volatile uint32_t *_ts = (volatile uint32_t *)0x92C027FC;
+		uint32_t _s = (*_ts)++;
+		if (_s < 31)
+			_tb[_s] = (0x10 << 24) | ((line_index & 0xF) << 20) |
+				  ((uint32_t)status & 0xFFFFF);
+	}
+
 	while (status) {
 		/* Handle current interrupts */
 		handle_irq_batch(cascade, line_index, status);

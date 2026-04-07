@@ -43,25 +43,14 @@ static void sai_start(struct dai *dai, int direction)
 #endif
 
 	if (direction == DAI_DIR_CAPTURE) {
-		/* Software Reset */
+		/* Software Reset RX only — never touch TX */
 		dai_update_bits(dai, REG_SAI_XCSR(DAI_DIR_CAPTURE),
 				REG_SAI_CSR_SR, REG_SAI_CSR_SR);
-		/* Clear SR bit to finish the reset */
 		dai_update_bits(dai, REG_SAI_XCSR(DAI_DIR_CAPTURE),
 				REG_SAI_CSR_SR, 0U);
-		/* Check if the opposite direction is also disabled */
-		xcsr = dai_read(dai, REG_SAI_XCSR(DAI_DIR_PLAYBACK));
-		if (!(xcsr & REG_SAI_CSR_FRDE)) {
-			/* Software Reset */
-			dai_update_bits(dai, REG_SAI_XCSR(DAI_DIR_PLAYBACK),
-					REG_SAI_CSR_SR, REG_SAI_CSR_SR);
-			/* Clear SR bit to finish the reset */
-			dai_update_bits(dai, REG_SAI_XCSR(DAI_DIR_PLAYBACK),
-					REG_SAI_CSR_SR, 0U);
-			/* Transmitter enable */
-			dai_update_bits(dai, REG_SAI_XCSR(DAI_DIR_PLAYBACK),
-					REG_SAI_CSR_TERE, REG_SAI_CSR_TERE);
-		}
+		/* TX clock must never stop (async mode, continuous clock).
+		 * TX TERE+TRCE are set once in sai_set_config and left running.
+		 */
 	} else {
 		/* Check if the opposite direction is also disabled */
 		xcsr = dai_read(dai, REG_SAI_XCSR(DAI_DIR_CAPTURE));
@@ -175,47 +164,35 @@ static void sai_stop(struct dai *dai, int direction)
 {
 	dai_info(dai, "SAI: sai_stop");
 
-	uint32_t xcsr = 0U;
 	int ret = 0;
 
 	/* Disable DMA request */
 	dai_update_bits(dai, REG_SAI_XCSR(direction),
 			REG_SAI_CSR_FRDE, 0);
 
-	/* Transmit/Receive data channel disable */
-	dai_update_bits(dai, REG_SAI_XCR3(direction),
-			REG_SAI_CR3_TRCE_MASK,
-			REG_SAI_CR3_TRCE(0));
-
 	/* Disable interrupts */
 	dai_update_bits(dai, REG_SAI_XCSR(direction),
 			REG_SAI_CSR_XIE_MASK, 0);
 
-	/* Disable transmitter/receiver */
+	/* ASYNC mode with continuous clock:
+	 * - TX (playback) direction: NEVER stop TRCE or TERE. TX is the clock
+	 *   master and its output pins are physically looped back to RX pins
+	 *   on the PCB. Stopping TX would drop BCLK/FSYNC and unlock the TAC
+	 *   codec PLL. Only FRDE (DMA request) is disabled above, which stops
+	 *   data movement while keeping BCLK/FSYNC running.
+	 * - RX (capture) direction: stop TRCE and TERE normally. RX is
+	 *   consumer-only; stopping it has no effect on clock generation.
+	 */
 	if (direction == DAI_DIR_CAPTURE) {
-		dai_update_bits(dai, REG_SAI_XCSR(DAI_DIR_CAPTURE), REG_SAI_CSR_TERE, 0);
+		dai_update_bits(dai, REG_SAI_XCR3(DAI_DIR_CAPTURE),
+				REG_SAI_CR3_TRCE_MASK, REG_SAI_CR3_TRCE(0));
+		dai_update_bits(dai, REG_SAI_XCSR(DAI_DIR_CAPTURE),
+				REG_SAI_CSR_TERE, 0);
 		ret = poll_for_register_delay(dai_base(dai) +
 					      REG_SAI_XCSR(DAI_DIR_CAPTURE),
 					      REG_SAI_CSR_TERE, 0, 100);
-
-		/* Check if the opposite direction is also disabled */
-		xcsr = dai_read(dai, REG_SAI_XCSR(DAI_DIR_PLAYBACK));
-		if (!(xcsr & REG_SAI_CSR_FRDE)) {
-			dai_update_bits(dai, REG_SAI_XCSR(DAI_DIR_PLAYBACK), REG_SAI_CSR_TERE, 0);
-			ret = poll_for_register_delay(dai_base(dai) +
-						      REG_SAI_XCSR(DAI_DIR_PLAYBACK),
-						      REG_SAI_CSR_TERE, 0, 100);
-		}
-	} else {
-		/* Check if the opposite direction is also disabled */
-		xcsr = dai_read(dai, REG_SAI_XCSR(DAI_DIR_CAPTURE));
-		if (!(xcsr & REG_SAI_CSR_FRDE)) {
-			dai_update_bits(dai, REG_SAI_XCSR(DAI_DIR_PLAYBACK), REG_SAI_CSR_TERE, 0);
-			ret = poll_for_register_delay(dai_base(dai) +
-						      REG_SAI_XCSR(DAI_DIR_PLAYBACK),
-						      REG_SAI_CSR_TERE, 0, 100);
-		}
 	}
+	/* TX: TRCE+TERE stay set — continuous clock for TAC PLL */
 
 	if (ret < 0)
 		dai_warn(dai, "sai: poll for register delay failed");
@@ -290,6 +267,7 @@ static inline int sai_set_config(struct dai *dai, struct ipc_config_dai *common_
 		 * frame sync starts one serial clock cycle earlier,
 		 * that is, together with the last bit of the previous
 		 * data word.
+		 * BCP set for DSP_A (standard SOF behavior).
 		 */
 		val_cr2 |= REG_SAI_CR2_BCP;
 		val_cr4 |= REG_SAI_CR4_FSE;
@@ -387,6 +365,7 @@ static inline int sai_set_config(struct dai *dai, struct ipc_config_dai *common_
 
 	val_cr4 |= REG_SAI_CR4_CHMOD;
 	val_cr4 |= REG_SAI_CR4_MF;
+	val_cr4 |= REG_SAI_CR4_FCONT;
 
 	val_cr5 |= REG_SAI_CR5_WNW(sywd) | REG_SAI_CR5_W0W(sywd) |
 			REG_SAI_CR5_FBT(sywd);
@@ -398,7 +377,8 @@ static inline int sai_set_config(struct dai *dai, struct ipc_config_dai *common_
 	mask_cr4  = REG_SAI_CR4_MF | REG_SAI_CR4_FSE |
 			REG_SAI_CR4_FSP | REG_SAI_CR4_FSD_MSTR |
 			REG_SAI_CR4_FRSZ_MASK | REG_SAI_CR4_SYWD_MASK |
-			REG_SAI_CR4_CHMOD_MASK | REG_SAI_CR4_FPACK_MASK;
+			REG_SAI_CR4_CHMOD_MASK | REG_SAI_CR4_FPACK_MASK |
+			REG_SAI_CR4_FCONT;
 
 	mask_cr5  = REG_SAI_CR5_WNW_MASK | REG_SAI_CR5_W0W_MASK |
 			REG_SAI_CR5_FBT_MASK;
@@ -412,8 +392,16 @@ static inline int sai_set_config(struct dai *dai, struct ipc_config_dai *common_
 	dai_update_bits(dai, REG_SAI_XMR(REG_TX_DIR), REG_SAI_XMR_MASK,
 			~(sai->params.tx_slots));
 
-	val_cr2 |= REG_SAI_CR2_SYNC;
+	/*
+	 * RX in asynchronous mode: RX receives BCLK/FSYNC from external pins
+	 * (physically looped from TX output through PCB traces). This provides
+	 * natural propagation delay matching between clock and data, essential
+	 * for clean capture with external TDM codecs like TAC5212.
+	 * RX is consumer (BCD=0, FSD=0) — clocks come from external pins.
+	 */
 	mask_cr2 |= REG_SAI_CR2_SYNC_MASK;
+	val_cr2 &= ~REG_SAI_CR2_BCD_MSTR;
+	val_cr4 &= ~REG_SAI_CR4_FSD_MSTR;
 
 	dai_update_bits(dai, REG_SAI_XCR1(REG_RX_DIR), REG_SAI_CR1_RFW_MASK,
 			dai->plat_data.fifo[REG_RX_DIR].watermark);
@@ -429,6 +417,13 @@ static inline int sai_set_config(struct dai *dai, struct ipc_config_dai *common_
 	 * For i.MX8MP, MCLK is bound with TX enable bit.
 	 * Therefore, enable transmitter to output MCLK
 	 */
+	/* Enable TX TRCE + TERE at boot for continuous clock output.
+	 * In async mode, RX receives clock from TX pins via PCB loopback.
+	 * Clock must be running before any capture starts.
+	 */
+	dai_update_bits(dai, REG_SAI_XCR3(REG_TX_DIR),
+			REG_SAI_CR3_TRCE_MASK, REG_SAI_CR3_TRCE(1));
+	dai_write(dai, REG_SAI_TDR0, 0x0);
 	dai_update_bits(dai, REG_SAI_XCSR(DAI_DIR_PLAYBACK),
 			REG_SAI_CSR_TERE, REG_SAI_CSR_TERE);
 	dai_update_bits(dai, REG_SAI_MCTL, REG_SAI_MCTL_MCLK_EN,

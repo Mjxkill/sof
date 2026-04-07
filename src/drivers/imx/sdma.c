@@ -6,6 +6,21 @@
 
 #include <sof/audio/component.h>
 #include <sof/drivers/sdma.h>
+
+/* Mini trace: 32 slots at 0x92C02780. Each slot = (ID<<24 | seq_number) */
+#define TRACE_BASE ((volatile uint32_t *)0x92C02780)
+#define TRACE_SEQ  ((volatile uint32_t *)0x92C027FC) /* slot 31 = seq counter */
+#define TRACE_EVT(id) do { \
+	uint32_t _s = (*TRACE_SEQ)++; \
+	if (_s < 31) TRACE_BASE[_s] = ((id) << 24) | (_s & 0xFFFFFF); \
+} while (0)
+
+#define T_PREP     0x01
+#define T_START    0x02
+#define T_STOP     0x03
+#define T_COPY     0x04
+#define T_GDS      0x05
+#define T_ISR      0x06
 #include <rtos/timer.h>
 #include <rtos/alloc.h>
 #include <sof/lib/dma.h>
@@ -67,6 +82,7 @@ struct sdma_chan {
 	struct sdma_ccb *ccb;
 	int hw_event;
 	int next_bd;
+	int current_bd;	/* BD available for host, flips each ISR */
 	int sdma_chan_type;
 	int fifo_paddr;
 
@@ -488,11 +504,17 @@ static int sdma_start(struct dma_chan_data *channel)
 {
 	tr_dbg(&sdma_tr, "sdma_start(%d)", channel->index);
 
+	TRACE_EVT(T_START);
+
 	if (channel->status != COMP_STATE_PREPARE &&
 	    channel->status != COMP_STATE_PAUSED)
 		return -EINVAL;
 
 	channel->status = COMP_STATE_ACTIVE;
+
+	/* Force dynamic context switch mode for continuous operation */
+	dma_reg_update_bits(channel->dma, SDMA_CONFIG,
+			    SDMA_CONFIG_CSM_MSK, SDMA_CONFIG_CSM_DYN);
 
 	sdma_enable_channel(channel->dma, channel->index);
 
@@ -501,7 +523,8 @@ static int sdma_start(struct dma_chan_data *channel)
 
 static int sdma_stop(struct dma_chan_data *channel)
 {
-	/* do not try to stop multiple times */
+	TRACE_EVT(T_STOP);
+
 	if (channel->status != COMP_STATE_ACTIVE &&
 	    channel->status != COMP_STATE_PAUSED)
 		return 0;
@@ -552,26 +575,26 @@ static int sdma_copy(struct dma_chan_data *channel, int bytes, uint32_t flags)
 		.channel = channel,
 		.elem.size = bytes,
 	};
-	int idx;
 
 	tr_dbg(&sdma_tr, "sdma_copy");
 
-	idx = (pdata->next_bd + 1) % 2;
-	pdata->next_bd = idx;
+	TRACE_EVT(T_COPY);
 
-	/* Work around the fact that we cannot allocate uncached memory
-	 * on all platforms supporting SDMA.
+	/* Flip first: now current_bd = the BD that just completed */
+	pdata->current_bd = (pdata->current_bd + 1) % pdata->desc_count;
+
+	/* Re-set DONE on completed BD — SDMA is on the OTHER BD now.
+	 * Must invalidate+writeback: SDMA reads BDs from physical memory.
 	 */
-	dcache_invalidate_region(&pdata->desc[idx].config,
-				 sizeof(pdata->desc[idx].config));
-	pdata->desc[idx].config |= SDMA_BD_DONE;
-	dcache_writeback_region(&pdata->desc[idx].config,
-				sizeof(pdata->desc[idx].config));
+	dcache_invalidate_region(&pdata->desc[pdata->current_bd].config,
+				 sizeof(pdata->desc[pdata->current_bd].config));
+	pdata->desc[pdata->current_bd].config |= SDMA_BD_DONE;
+	dcache_writeback_region(&pdata->desc[pdata->current_bd].config,
+				sizeof(pdata->desc[pdata->current_bd].config));
+
 
 	notifier_event(channel, NOTIFIER_ID_DMA_COPY,
 		       NOTIFIER_TARGET_CORE_LOCAL, &next, sizeof(next));
-
-	sdma_enable_channel(channel->dma, channel->index);
 
 	return 0;
 }
@@ -752,22 +775,24 @@ static int sdma_prep_desc(struct dma_chan_data *channel,
 	}
 
 	pdata->next_bd = 0;
+	pdata->current_bd = 1; /* DMA starts on BD[0], host accesses BD[1] */
 
-	/* Silence "may be used uninitialized" warnings with gcc10 -O1
-	 * and maybe other compilers/levels that don't know that
-	 * config->elem_array.count > 0
-	 */
+	/* Clear trace buffer */
+	{
+		int _t;
+		for (_t = 0; _t < 32; _t++)
+			TRACE_BASE[_t] = 0;
+	}
+	TRACE_EVT(T_PREP);
+	/* Store BD[0] address for debug read from A53 */
+	(*(volatile uint32_t *)0x92C027D0) = (uint32_t)&pdata->desc[0];
+	(*(volatile uint32_t *)0x92C027D4) = (uint32_t)&pdata->desc[1];
+
 	bd = &pdata->desc[0];
 	width = 0;
 
 	for (i = 0; i < config->elem_array.count; i++) {
 		bd = &pdata->desc[i];
-		/* For MEM2DEV and DEV2MEM, buf_addr holds the RAM address and
-		 * the FIFO address is stored in one of the general registers of
-		 * the SDMA core.
-		 * For MEM2MEM the source is stored in buf_addr and destination
-		 * is in buf_xaddr.
-		 */
 		switch (config->direction) {
 		case DMA_DIR_MEM_TO_DEV:
 			bd->buf_addr = config->elem_array.elems[i].src;
@@ -791,15 +816,12 @@ static int sdma_prep_desc(struct dma_chan_data *channel,
 		if (!config->irq_disabled)
 			bd->config |= SDMA_BD_INT;
 
-		bd->config |= SDMA_BD_CONT;
-		if (pdata->next_bd == i)
-			bd->config |= SDMA_BD_DONE;
+		bd->config |= SDMA_BD_CONT | SDMA_BD_DONE;
 	}
 
-	/* Configure last BD to account for cyclic transfers */
+	/* Last BD: WRAP to loop back. Keep CONT for continuous operation. */
 	if (config->cyclic)
 		bd->config |= SDMA_BD_WRAP;
-	bd->config &= ~SDMA_BD_CONT;
 
 	/* CCB must point to buffer descriptors array */
 	memset(pdata->ccb, 0, sizeof(*pdata->ccb));
@@ -959,30 +981,21 @@ static int sdma_get_attribute(struct dma *dma, uint32_t type, uint32_t *value)
 static int sdma_get_data_size(struct dma_chan_data *channel, uint32_t *avail,
 			      uint32_t *free)
 {
-	/* Check buffer descriptors, those with "DONE" = 0 are for the
-	 * host, "DONE" = 1 are for SDMA. The host side are either
-	 * available or free.
-	 */
 	struct sdma_chan *pdata = dma_chan_get_data(channel);
-	uint32_t result_data = 0;
-	int i;
+	uint32_t result_data;
 
 	tr_dbg(&sdma_tr, "sdma_get_data_size(%d)", channel->index);
 	if (channel->index == 0) {
-		/* Channel 0 shouldn't have this called anyway */
-		tr_err(&sdma_tr, "Please do not call get_data_size on SDMA channel 0!");
 		*avail = *free = 0;
 		return -EINVAL;
 	}
 
-	dcache_invalidate_region(pdata->desc, sizeof(pdata->desc[0]) * SDMA_MAX_BDS);
+	TRACE_EVT(T_GDS);
 
-	for (i = 0; i < pdata->desc_count && i < SDMA_MAX_BDS; i++) {
-		if (pdata->desc[i].config & SDMA_BD_DONE)
-			continue; /* These belong to SDMA controller */
-		result_data += pdata->desc[i].config &
-			SDMA_BD_COUNT_MASK;
-	}
+	/* Always exactly 1 period, tracked by current_bd */
+	result_data = pdata->desc[pdata->current_bd].config &
+		      SDMA_BD_COUNT_MASK;
+
 
 	*avail = *free = 0;
 	switch (channel->direction) {

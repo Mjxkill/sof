@@ -167,10 +167,23 @@
 #define HEAP_BUFFER_BLOCK_SIZE		0x100
 #define HEAP_BUFFER_COUNT	(HEAP_BUFFER_SIZE / HEAP_BUFFER_BLOCK_SIZE)
 
+/* DMA buffer pools in DSP local OCRAM — no DDR bus contention.
+ * RX in DRAM0, TX in DRAM1 — separate banks.
+ */
+#define HEAP_HP_RX_BASE			DRAM0_BASE
+#define HEAP_HP_RX_SIZE			DRAM0_SIZE
+#define HEAP_HP_RX_BLOCK_SIZE		0x100
+#define HEAP_HP_RX_COUNT		(HEAP_HP_RX_SIZE / HEAP_HP_RX_BLOCK_SIZE)
+
+#define HEAP_HP_TX_BASE			DRAM1_BASE
+#define HEAP_HP_TX_SIZE			DRAM1_SIZE
+#define HEAP_HP_TX_BLOCK_SIZE		0x100
+#define HEAP_HP_TX_COUNT		(HEAP_HP_TX_SIZE / HEAP_HP_TX_BLOCK_SIZE)
+
 #define PLATFORM_HEAP_SYSTEM		1 /* one per core */
 #define PLATFORM_HEAP_SYSTEM_RUNTIME	1 /* one per core */
 #define PLATFORM_HEAP_RUNTIME		1
-#define PLATFORM_HEAP_BUFFER		1
+#define PLATFORM_HEAP_BUFFER		3
 
 /* Stack configuration */
 #define SOF_STACK_SIZE		(CONFIG_SOF_STACK_SIZE)

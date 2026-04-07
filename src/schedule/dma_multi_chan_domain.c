@@ -287,22 +287,34 @@ static bool dma_multi_chan_domain_is_pending(struct ll_schedule_domain *domain,
 		if (dmas[i].chan == NULL)
 			continue;
 		for (j = 0; j < dmas[i].plat_data.channels; ++j) {
-			if (!*comp) {
-				status = dma_interrupt_legacy(&dmas[i].chan[j],
-							      DMA_IRQ_STATUS_GET);
-				if (!status)
-					continue;
-
-				*comp = dma_domain->data[i][j].task->sched_comp;
-			} else if (!dma_domain->data[i][j].task ||
-				   dma_domain->data[i][j].task->sched_comp != *comp) {
+			if (!dma_domain->data[i][j].task)
 				continue;
-			}
 
-			/* not the same scheduling component */
+			/* Each task checks its own DMA channel status.
+			 * On SDMA (single interrupt for all channels),
+			 * multiple channels may complete simultaneously.
+			 * All must be serviced in the same interrupt to
+			 * avoid FIFO overflow on the delayed channel.
+			 */
 			if (dma_domain->data[i][j].task->sched_comp !=
 			    pipe_task->sched_comp)
 				continue;
+
+			status = dma_interrupt_legacy(&dmas[i].chan[j],
+						      DMA_IRQ_STATUS_GET);
+			if (!status)
+				continue;
+
+			/* Debug: ISR trace */
+			{
+				volatile uint32_t *_tb = (volatile uint32_t *)0x92C02780;
+				volatile uint32_t *_ts = (volatile uint32_t *)0x92C027FC;
+				uint32_t _s = (*_ts)++;
+				if (_s < 31) _tb[_s] = (0x06 << 24) | (_s & 0xFFFFFF);
+			}
+
+			/* Mark that at least one task is pending */
+			*comp = pipe_task->sched_comp;
 
 			/* Schedule task based on the frequency they
 			 * were configured with, not time (task.start)

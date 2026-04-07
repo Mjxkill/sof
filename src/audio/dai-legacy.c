@@ -567,8 +567,13 @@ int dai_common_params(struct dai_data *dd, struct comp_dev *dev,
 			return err;
 		}
 	} else {
-		dd->dma_buffer = buffer_alloc(buffer_size, SOF_MEM_CAPS_DMA, 0,
-					      addr_align, false);
+		dd->dma_buffer = buffer_alloc(buffer_size,
+					      SOF_MEM_CAPS_DMA | SOF_MEM_CAPS_HP,
+					      0, addr_align, false);
+		if (!dd->dma_buffer)
+			dd->dma_buffer = buffer_alloc(buffer_size,
+						      SOF_MEM_CAPS_DMA, 0,
+						      addr_align, false);
 		if (!dd->dma_buffer) {
 			comp_err(dev, "dai_params(): failed to alloc dma buffer");
 			return -ENOMEM;

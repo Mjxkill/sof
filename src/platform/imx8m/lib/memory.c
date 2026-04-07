@@ -55,6 +55,17 @@ static SHARED_DATA struct block_map buf_heap_map[] = {
 	BLOCK_DEF(HEAP_BUFFER_BLOCK_SIZE, HEAP_BUFFER_COUNT, buf_block),
 };
 
+/* DMA buffer pools in DSP OCRAM — RX in DRAM0, TX in DRAM1 */
+static SHARED_DATA struct block_hdr hp_rx_block[HEAP_HP_RX_COUNT];
+static SHARED_DATA struct block_hdr hp_tx_block[HEAP_HP_TX_COUNT];
+
+static SHARED_DATA struct block_map hp_rx_heap_map[] = {
+	BLOCK_DEF(HEAP_HP_RX_BLOCK_SIZE, HEAP_HP_RX_COUNT, hp_rx_block),
+};
+static SHARED_DATA struct block_map hp_tx_heap_map[] = {
+	BLOCK_DEF(HEAP_HP_TX_BLOCK_SIZE, HEAP_HP_TX_COUNT, hp_tx_block),
+};
+
 static SHARED_DATA struct mm memmap = {
 	.system[0] = {
 		.heap = HEAP_SYSTEM_BASE,
@@ -90,8 +101,27 @@ static SHARED_DATA struct mm memmap = {
 		.caps = SOF_MEM_CAPS_RAM | SOF_MEM_CAPS_CACHE |
 			SOF_MEM_CAPS_DMA,
 	},
+	.buffer[1] = {
+		.blocks = ARRAY_SIZE(hp_rx_heap_map),
+		.map = hp_rx_heap_map,
+		.heap = HEAP_HP_RX_BASE,
+		.size = HEAP_HP_RX_SIZE,
+		.info = {.free = HEAP_HP_RX_SIZE,},
+		.caps = SOF_MEM_CAPS_RAM | SOF_MEM_CAPS_DMA |
+			SOF_MEM_CAPS_HP,
+	},
+	.buffer[2] = {
+		.blocks = ARRAY_SIZE(hp_tx_heap_map),
+		.map = hp_tx_heap_map,
+		.heap = HEAP_HP_TX_BASE,
+		.size = HEAP_HP_TX_SIZE,
+		.info = {.free = HEAP_HP_TX_SIZE,},
+		.caps = SOF_MEM_CAPS_RAM | SOF_MEM_CAPS_DMA |
+			SOF_MEM_CAPS_HP,
+	},
 	.total = {.free = HEAP_SYSTEM_SIZE + HEAP_SYS_RUNTIME_SIZE +
-			HEAP_RUNTIME_SIZE + HEAP_BUFFER_SIZE,},
+			HEAP_RUNTIME_SIZE + HEAP_BUFFER_SIZE +
+			HEAP_HP_RX_SIZE + HEAP_HP_TX_SIZE,},
 };
 
 void platform_init_memmap(struct sof *sof)
