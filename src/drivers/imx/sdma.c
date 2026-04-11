@@ -852,13 +852,16 @@ static int sdma_prep_desc(struct dma_chan_data *channel,
 		return -EINVAL;
 	}
 
-	watermark = (config->burst_elems * width) / 8;
-
 	if (pdata->sdma_chan_type == SDMA_CHAN_TYPE_SAI2MCU) {
+		/* MICFIL multi-FIFO NXP hack: needs SW_DONE + N_FIFOS bits */
+		watermark = (config->burst_elems * width) / 8;
 		sdma_set_watermarklevel(channel);
 		watermark |= pdata->watermark_level;
 	} else {
-		watermark = (config->burst_elems * width) / 8;
+		/* SHP2MCU/MCU2SHP: g_reg[7] expects watermark in WORDS.
+		 * burst_elems = FIFO depth = 128; watermark = 64 = half FIFO.
+		 */
+		watermark = config->burst_elems / 2;
 	}
 
 	memset(pdata->ctx, 0, sizeof(*pdata->ctx));
