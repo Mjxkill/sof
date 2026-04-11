@@ -10,13 +10,16 @@
 #ifndef __PLATFORM_LIB_DMA_H__
 #define __PLATFORM_LIB_DMA_H__
 
-#define PLATFORM_NUM_DMACS	2
+/* Single SDMA3 instance handles both DAI (SAI/MICFIL) and host memory
+ * transfers via the AP2AP script. DMA_ID_HOST (formerly dummy_dma CPU
+ * memcpy fallback) has been removed — see src/platform/imx8m/lib/dma.c.
+ */
+#define PLATFORM_NUM_DMACS	1
 
 /* max number of supported DMA channels */
 #define PLATFORM_MAX_DMA_CHAN	32
 
 #define DMA_ID_SDMA2	0
-#define DMA_ID_HOST	1
 #define DMA_ID_SDMA3	2
 
 #define dma_chan_irq(dma, chan) dma_irq(dma)

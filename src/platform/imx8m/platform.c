@@ -186,10 +186,16 @@ int platform_init(struct sof *sof)
 	if (ret < 0)
 		return -ENODEV;
 
-	/* Init SDMA platform domain */
+	/* Init SDMA platform domain.
+	 *
+	 * Phase 2 refactor: PLATFORM_NUM_DMACS is now 1 and the single entry
+	 * (dma_array[0]) is SDMA3, which handles both DAI and host transfers.
+	 * Previously this skipped dma_array[0] because index 0 was the dummy
+	 * CPU DMA, but that entry has been removed.
+	 */
 	sof->platform_dma_domain =
-		dma_multi_chan_domain_init(&sof->dma_info->dma_array[1],
-					   PLATFORM_NUM_DMACS - 1,
+		dma_multi_chan_domain_init(&sof->dma_info->dma_array[0],
+					   PLATFORM_NUM_DMACS,
 					   PLATFORM_DEFAULT_CLOCK, true);
 
 	/* i.MX platform DMA domain will be full synchronous, no time dependent */
