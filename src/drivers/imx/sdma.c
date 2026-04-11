@@ -684,8 +684,11 @@ static int sdma_read_config(struct dma_chan_data *channel,
 {
 	int i;
 	struct sdma_chan *pdata = dma_chan_get_data(channel);
-	struct dai_data *dd = channel->dev_data;
-	uint32_t dma_dev = dd->dai->drv->dma_dev;
+
+	/* Note: do NOT dereference channel->dev_data as dai_data at this
+	 * scope: for host (AP2AP) channels, dev_data is host_data, not
+	 * dai_data. The dai_data access must happen only in DEV cases.
+	 */
 
 	switch (config->direction) {
 	case DMA_DIR_MEM_TO_DEV:
@@ -693,7 +696,10 @@ static int sdma_read_config(struct dma_chan_data *channel,
 		pdata->sdma_chan_type = SDMA_CHAN_TYPE_MCU2SHP;
 		pdata->fifo_paddr = config->elem_array.elems[0].dest;
 		break;
-	case DMA_DIR_DEV_TO_MEM:
+	case DMA_DIR_DEV_TO_MEM: {
+		struct dai_data *dd = channel->dev_data;
+		uint32_t dma_dev = dd->dai->drv->dma_dev;
+
 		pdata->hw_event = config->src_dev;
 		if (dma_dev == DMA_DEV_MICFIL)
 			pdata->sdma_chan_type = SDMA_CHAN_TYPE_SAI2MCU;
@@ -701,9 +707,17 @@ static int sdma_read_config(struct dma_chan_data *channel,
 			pdata->sdma_chan_type = SDMA_CHAN_TYPE_SHP2MCU;
 		pdata->fifo_paddr = config->elem_array.elems[0].src;
 		break;
+	}
 	case DMA_DIR_MEM_TO_MEM:
+	case DMA_DIR_HMEM_TO_LMEM:
+	case DMA_DIR_LMEM_TO_HMEM:
+		/* Host memory <-> DSP local memory via SDMA AP2AP script.
+		 * No hardware event — software triggered by sdma_start().
+		 */
 		pdata->sdma_chan_type = SDMA_CHAN_TYPE_AP2AP;
-		/* Fallthrough, TODO: implement to support m2m */
+		pdata->hw_event = -1;
+		pdata->fifo_paddr = 0;
+		break;
 	default:
 		tr_err(&sdma_tr, "sdma_set_config: Unsupported direction %d",
 		       config->direction);
@@ -803,6 +817,11 @@ static int sdma_prep_desc(struct dma_chan_data *channel,
 			width = config->dest_width;
 			break;
 		case DMA_DIR_MEM_TO_MEM:
+		case DMA_DIR_HMEM_TO_LMEM:
+		case DMA_DIR_LMEM_TO_HMEM:
+			/* AP2AP script consumes source in buf_addr and
+			 * destination in buf_xaddr.
+			 */
 			bd->buf_addr = config->elem_array.elems[i].src;
 			bd->buf_xaddr = config->elem_array.elems[i].dest;
 			width = config->dest_width;
@@ -857,6 +876,11 @@ static int sdma_prep_desc(struct dma_chan_data *channel,
 		watermark = (config->burst_elems * width) / 8;
 		sdma_set_watermarklevel(channel);
 		watermark |= pdata->watermark_level;
+	} else if (pdata->sdma_chan_type == SDMA_CHAN_TYPE_AP2AP) {
+		/* AP2AP uses g_reg[7] as RAM base address (0x40000000),
+		 * not a watermark. Set to 0 here; overwritten below.
+		 */
+		watermark = 0;
 	} else {
 		/* SHP2MCU/MCU2SHP: g_reg[7] expects watermark in WORDS.
 		 * burst_elems = FIFO depth = 128; watermark = 64 = half FIFO.
@@ -1007,6 +1031,16 @@ static int sdma_get_data_size(struct dma_chan_data *channel, uint32_t *avail,
 		break;
 	case DMA_DIR_DEV_TO_MEM:
 		*avail = result_data;
+		break;
+	case DMA_DIR_MEM_TO_MEM:
+	case DMA_DIR_HMEM_TO_LMEM:
+	case DMA_DIR_LMEM_TO_HMEM:
+		/* AP2AP: the period size stored in the BD count applies to
+		 * both sides of the transfer (input to produce, output to
+		 * consume).
+		 */
+		*avail = result_data;
+		*free = result_data;
 		break;
 	default:
 		tr_err(&sdma_tr, "sdma_get_data_size channel invalid direction");
