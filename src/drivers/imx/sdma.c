@@ -21,6 +21,33 @@
 #define T_COPY     0x04
 #define T_GDS      0x05
 #define T_ISR      0x06
+
+/* AP2AP DEBUG instrumentation — temporary, Phase 2 hardware test.
+ * Layout in SDRAM1 area (0x92C02C00-0x92C02CFF, 256 bytes):
+ *   +0x00 : channel_get_total
+ *   +0x04 : channel_get_ap2ap_returned (count of channels handed to host)
+ *   +0x08 : read_config_total
+ *   +0x0C : read_config_ap2ap          (HMEM/LMEM/M2M case taken)
+ *   +0x10 : prep_desc_total
+ *   +0x14 : prep_desc_ap2ap            (BD setup ran the AP2AP branch)
+ *   +0x18 : set_config_total
+ *   +0x1C : set_config_ap2ap_ok        (sdma_set_config returned OK for AP2AP)
+ *   +0x20 : start_total
+ *   +0x24 : start_ap2ap                (sdma_start called on an AP2AP chan)
+ *   +0x28 : copy_total
+ *   +0x2C : copy_ap2ap                 (sdma_copy called on an AP2AP chan)
+ *   +0x30 : last_ap2ap_chan_index
+ *   +0x34 : last_ap2ap_direction
+ *   +0x38 : last_ap2ap_buf_addr        (src in BD)
+ *   +0x3C : last_ap2ap_buf_xaddr       (dest in BD)
+ *   +0x40 : last_ap2ap_size            (BD count = period bytes)
+ *   +0x44 : last_ap2ap_burst_elems
+ *   +0x48 : read_config_einval         (paths returning -EINVAL)
+ *   +0x4C : last_einval_direction
+ */
+#define APDBG ((volatile uint32_t *)0x92C02C00)
+#define APDBG_INC(off) do { APDBG[(off)/4]++; } while (0)
+#define APDBG_SET(off, v) do { APDBG[(off)/4] = (uint32_t)(v); } while (0)
 #include <rtos/timer.h>
 #include <rtos/alloc.h>
 #include <sof/lib/dma.h>
@@ -449,6 +476,7 @@ static struct dma_chan_data *sdma_channel_get(struct dma *dma,
 
 		/* Allow events, allow manual */
 		sdma_set_overrides(channel, false, false);
+		APDBG_INC(0x00); /* channel_get_total */
 		return channel;
 	}
 	tr_err(&sdma_tr, "sdma no channel free");
@@ -502,9 +530,14 @@ static void sdma_channel_put(struct dma_chan_data *channel)
 
 static int sdma_start(struct dma_chan_data *channel)
 {
+	struct sdma_chan *pdata = dma_chan_get_data(channel);
+
 	tr_dbg(&sdma_tr, "sdma_start(%d)", channel->index);
 
 	TRACE_EVT(T_START);
+	APDBG_INC(0x20); /* start_total */
+	if (pdata->sdma_chan_type == SDMA_CHAN_TYPE_AP2AP)
+		APDBG_INC(0x24); /* start_ap2ap */
 
 	if (channel->status != COMP_STATE_PREPARE &&
 	    channel->status != COMP_STATE_PAUSED)
@@ -579,6 +612,84 @@ static int sdma_copy(struct dma_chan_data *channel, int bytes, uint32_t flags)
 	tr_dbg(&sdma_tr, "sdma_copy");
 
 	TRACE_EVT(T_COPY);
+	APDBG_INC(0x28); /* copy_total */
+	if (pdata->sdma_chan_type == SDMA_CHAN_TYPE_AP2AP)
+		APDBG_INC(0x2C); /* copy_ap2ap */
+
+	if (pdata->sdma_chan_type == SDMA_CHAN_TYPE_AP2AP) {
+		/* AP2AP is a ONE-SHOT memory-to-memory transfer with NO
+		 * peripheral event. We must: (1) kick the SDMA channel
+		 * manually, (2) wait synchronously for the BD DONE flag to
+		 * be cleared (i.e. the transfer to complete), (3) invalidate
+		 * the destination cache so the DSP reads fresh data, then
+		 * fire the notifier. This matches dummy_dma's synchronous
+		 * memcpy semantics — caller expects the data to be ready
+		 * when sdma_copy returns.
+		 */
+		struct sdma_bd *bd = &pdata->desc[0];
+		int timeout_us = 10000; /* 10 ms — plenty for <= 64 KB */
+
+		/* Guard: skip the kick if addresses are invalid (happens
+		 * between hw_params and first trigger when the host page
+		 * table isn't populated yet).
+		 */
+		if (!bd->buf_addr || !bd->buf_xaddr) {
+			tr_warn(&sdma_tr,
+				"sdma_copy AP2AP skip null addr chan=%d",
+				channel->index);
+			return 0;
+		}
+
+		/* Re-arm DONE on the BD we are about to process.
+		 * dma_set_config (via sdma_prep_desc) already wrote the
+		 * new buf_addr / buf_xaddr / count.
+		 */
+		dcache_invalidate_region(&bd->config, sizeof(bd->config));
+		bd->config |= SDMA_BD_DONE;
+		dcache_writeback_region(&bd->config, sizeof(bd->config));
+
+		/* Kick the SDMA channel — AP2AP has no peripheral event */
+		sdma_enable_channel(channel->dma, channel->index);
+
+		/* Poll BD DONE bit. SDMA clears it when the transfer
+		 * finishes. The BD lives in DDR-cached memory, so we MUST
+		 * invalidate each iteration to observe hardware writes.
+		 */
+		while (timeout_us--) {
+			dcache_invalidate_region(&bd->config,
+						 sizeof(bd->config));
+			if (!(bd->config & SDMA_BD_DONE))
+				break;
+			wait_delay_us(1);
+		}
+
+		if (timeout_us <= 0) {
+			tr_err(&sdma_tr,
+			       "sdma_copy AP2AP timeout chan=%d src=0x%x dst=0x%x",
+			       channel->index,
+			       (unsigned int)bd->buf_addr,
+			       (unsigned int)bd->buf_xaddr);
+			sdma_disable_channel(channel->dma, channel->index);
+			return -ETIMEDOUT;
+		}
+
+		/* Transfer done — invalidate destination so DSP reads
+		 * fresh data (SDMA wrote it via the bus, bypassing the
+		 * DSP L1 cache).
+		 */
+		dcache_invalidate_region((void *)(uintptr_t)bd->buf_xaddr,
+					 bytes);
+
+		notifier_event(channel, NOTIFIER_ID_DMA_COPY,
+			       NOTIFIER_TARGET_CORE_LOCAL, &next,
+			       sizeof(next));
+		return 0;
+	}
+
+	/* Cyclic path (SHP2MCU / MCU2SHP for DAI/MICFIL): just re-arm
+	 * the DONE bit on the completed BD — the SDMA hardware keeps
+	 * cycling via CONT+WRAP, triggered by peripheral events.
+	 */
 
 	/* Flip first: now current_bd = the BD that just completed */
 	pdata->current_bd = (pdata->current_bd + 1) % pdata->desc_count;
@@ -685,6 +796,8 @@ static int sdma_read_config(struct dma_chan_data *channel,
 	int i;
 	struct sdma_chan *pdata = dma_chan_get_data(channel);
 
+	APDBG_INC(0x08); /* read_config_total */
+
 	/* Note: do NOT dereference channel->dev_data as dai_data at this
 	 * scope: for host (AP2AP) channels, dev_data is host_data, not
 	 * dai_data. The dai_data access must happen only in DEV cases.
@@ -717,8 +830,14 @@ static int sdma_read_config(struct dma_chan_data *channel,
 		pdata->sdma_chan_type = SDMA_CHAN_TYPE_AP2AP;
 		pdata->hw_event = -1;
 		pdata->fifo_paddr = 0;
+		APDBG_INC(0x0C); /* read_config_ap2ap */
+		APDBG_SET(0x30, channel->index); /* last_ap2ap_chan_index */
+		APDBG_SET(0x34, config->direction); /* last_ap2ap_direction */
+		APDBG_SET(0x44, config->burst_elems); /* last_ap2ap_burst_elems */
 		break;
 	default:
+		APDBG_INC(0x48); /* read_config_einval */
+		APDBG_SET(0x4C, config->direction); /* last_einval_direction */
 		tr_err(&sdma_tr, "sdma_set_config: Unsupported direction %d",
 		       config->direction);
 		return -EINVAL;
@@ -776,6 +895,8 @@ static int sdma_prep_desc(struct dma_chan_data *channel,
 	struct sdma_chan *pdata = dma_chan_get_data(channel);
 	struct sdma_bd *bd;
 
+	APDBG_INC(0x10); /* prep_desc_total */
+
 	/* Validate requested configuration */
 	if (config->elem_array.count > SDMA_MAX_BDS) {
 		tr_err(&sdma_tr, "sdma_set_config: Unable to handle %d descriptors",
@@ -825,6 +946,15 @@ static int sdma_prep_desc(struct dma_chan_data *channel,
 			bd->buf_addr = config->elem_array.elems[i].src;
 			bd->buf_xaddr = config->elem_array.elems[i].dest;
 			width = config->dest_width;
+			APDBG_INC(0x14); /* prep_desc_ap2ap */
+			APDBG_SET(0x38, bd->buf_addr); /* last src */
+			APDBG_SET(0x3C, bd->buf_xaddr); /* last dst */
+			APDBG_SET(0x40, config->elem_array.elems[i].size);
+			/* Null addresses are expected at host_params() time
+			 * (host page table not yet received). Accept silently;
+			 * sdma_copy() guards the actual transfer against null
+			 * addrs. dummy_dma behaved the same way.
+			 */
 			break;
 		default:
 			return -EINVAL;
@@ -918,18 +1048,26 @@ static int sdma_set_config(struct dma_chan_data *channel,
 	struct sdma_chan *pdata = dma_chan_get_data(channel);
 	int ret;
 
+	APDBG_INC(0x18); /* set_config_total */
+
 	tr_dbg(&sdma_tr, "sdma_set_config channel %d", channel->index);
 
 	ret = sdma_read_config(channel, config);
-	if (ret < 0)
+	if (ret < 0) {
+		APDBG_SET(0x50, (uint32_t)ret); /* diag: read_config err */
 		return ret;
+	}
+	APDBG_INC(0x54); /* past_read_config */
 
 	channel->is_scheduling_source = config->is_scheduling_source;
 	channel->direction = config->direction;
 
 	ret = sdma_prep_desc(channel, config);
-	if (ret < 0)
+	if (ret < 0) {
+		APDBG_SET(0x58, (uint32_t)ret); /* diag: prep_desc err */
 		return ret;
+	}
+	APDBG_INC(0x5C); /* past_prep_desc */
 
 	/* allow events + allow manual start */
 	sdma_set_overrides(channel, false, false);
@@ -937,9 +1075,11 @@ static int sdma_set_config(struct dma_chan_data *channel,
 	/* Upload context */
 	ret = sdma_upload_context(channel);
 	if (ret < 0) {
+		APDBG_SET(0x60, (uint32_t)ret); /* diag: upload_ctx err */
 		tr_err(&sdma_tr, "Unable to upload context, bailing");
 		return ret;
 	}
+	APDBG_INC(0x64); /* past_upload_context */
 
 	tr_dbg(&sdma_tr, "SDMA context uploaded");
 	/* Context uploaded, we can set up events now */
@@ -949,6 +1089,15 @@ static int sdma_set_config(struct dma_chan_data *channel,
 	dma_reg_write(channel->dma, SDMA_CHNPRI(channel->index), SDMA_DEFPRI);
 
 	channel->status = COMP_STATE_PREPARE;
+
+	if (pdata->sdma_chan_type == SDMA_CHAN_TYPE_AP2AP)
+		APDBG_INC(0x1C); /* set_config_ap2ap_ok */
+
+	/* AP2AP: do NOT auto-start here. sdma_copy() kicks the channel
+	 * itself and waits synchronously for DONE (see the AP2AP branch
+	 * there). Starting in set_config AND again in copy would cause
+	 * the transfer to run twice on every period.
+	 */
 
 	return 0;
 }
