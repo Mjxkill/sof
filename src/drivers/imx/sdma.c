@@ -966,12 +966,14 @@ static int sdma_prep_desc(struct dma_chan_data *channel,
 			bd->config |= SDMA_BD_INT;
 
 		if (pdata->sdma_chan_type == SDMA_CHAN_TYPE_AP2AP) {
-			/* AP2AP: EXTD so the ROM script reads buf_xaddr
-			 * (destination). Same pattern as sdma_run_c0.
-			 * No CONT — one-shot transfer, WRAP set below to
-			 * cleanly halt the script after the BD completes.
+			/* AP2AP one-shot memcpy: match Linux upstream
+			 * sdma_prep_memcpy pattern — EXTD (buf_xaddr valid),
+			 * DONE (SDMA ready to run), LAST (mark end of chain
+			 * so the script clears DONE on completion). No CONT
+			 * (single BD only). WRAP added below.
 			 */
-			bd->config |= SDMA_BD_EXTD | SDMA_BD_DONE;
+			bd->config |= SDMA_BD_EXTD | SDMA_BD_DONE |
+				      SDMA_BD_LAST;
 		} else {
 			/* Cyclic DAI path (SHP2MCU/MCU2SHP): keep CONT so
 			 * SDMA continues into next BD. WRAP added below for
