@@ -965,11 +965,28 @@ static int sdma_prep_desc(struct dma_chan_data *channel,
 		if (!config->irq_disabled)
 			bd->config |= SDMA_BD_INT;
 
-		bd->config |= SDMA_BD_CONT | SDMA_BD_DONE;
+		if (pdata->sdma_chan_type == SDMA_CHAN_TYPE_AP2AP) {
+			/* AP2AP: EXTD so the ROM script reads buf_xaddr
+			 * (destination). Same pattern as sdma_run_c0.
+			 * No CONT — one-shot transfer, WRAP set below to
+			 * cleanly halt the script after the BD completes.
+			 */
+			bd->config |= SDMA_BD_EXTD | SDMA_BD_DONE;
+		} else {
+			/* Cyclic DAI path (SHP2MCU/MCU2SHP): keep CONT so
+			 * SDMA continues into next BD. WRAP added below for
+			 * cyclic configs.
+			 */
+			bd->config |= SDMA_BD_CONT | SDMA_BD_DONE;
+		}
 	}
 
-	/* Last BD: WRAP to loop back. Keep CONT for continuous operation. */
-	if (config->cyclic)
+	/* Mark end of chain:
+	 *  - cyclic DAI: WRAP on last BD to loop back to first.
+	 *  - AP2AP one-shot: WRAP so SDMA halts cleanly after the single BD.
+	 */
+	if (config->cyclic ||
+	    pdata->sdma_chan_type == SDMA_CHAN_TYPE_AP2AP)
 		bd->config |= SDMA_BD_WRAP;
 
 	/* CCB must point to buffer descriptors array */
@@ -1022,8 +1039,10 @@ static int sdma_prep_desc(struct dma_chan_data *channel,
 	pdata->ctx->pc = sdma_script_addr;
 
 	if (pdata->sdma_chan_type == SDMA_CHAN_TYPE_AP2AP) {
-		/* Base of RAM, TODO must be moved to a define */
-		pdata->ctx->g_reg[7] = 0x40000000;
+		/* ap_2_ap ROM script takes NO context parameters per
+		 * i.MX8MP TRM: source/dest come from BD.buf_addr /
+		 * BD.buf_xaddr. Context is already memset to 0 above.
+		 */
 	} else {
 		if (pdata->hw_event != -1) {
 			if (pdata->hw_event >= 32)
@@ -1069,8 +1088,18 @@ static int sdma_set_config(struct dma_chan_data *channel,
 	}
 	APDBG_INC(0x5C); /* past_prep_desc */
 
-	/* allow events + allow manual start */
-	sdma_set_overrides(channel, false, false);
+	/* AP2AP is software-triggered (no HW event). The SDMA runnability
+	 * formula (TRM §7.2) requires (event_pending OR EVTOVR) to be true.
+	 * With no event mapped in CHNENBL for AP2AP, event_pending=0 forever,
+	 * so we MUST set EVTOVR=1 otherwise HSTART is ignored and the channel
+	 * never runs. Same pattern as sdma_run_c0() for channel 0.
+	 * DAI channels keep (false, false) to let the peripheral event drive
+	 * the transfer.
+	 */
+	if (pdata->sdma_chan_type == SDMA_CHAN_TYPE_AP2AP)
+		sdma_set_overrides(channel, true, false);
+	else
+		sdma_set_overrides(channel, false, false);
 
 	/* Upload context */
 	ret = sdma_upload_context(channel);
