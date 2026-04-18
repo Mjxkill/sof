@@ -487,6 +487,8 @@ static void sdma_channel_put(struct dma_chan_data *channel)
 
 static int sdma_start(struct dma_chan_data *channel)
 {
+	struct sdma_chan *pdata = dma_chan_get_data(channel);
+
 	tr_dbg(&sdma_tr, "sdma_start(%d)", channel->index);
 
 	if (channel->status != COMP_STATE_PREPARE &&
@@ -499,7 +501,18 @@ static int sdma_start(struct dma_chan_data *channel)
 	dma_reg_update_bits(channel->dma, SDMA_CONFIG,
 			    SDMA_CONFIG_CSM_MSK, SDMA_CONFIG_CSM_DYN);
 
-	sdma_enable_channel(channel->dma, channel->index);
+	/* AP2AP one-shot channels are manually kicked by sdma_copy() each
+	 * period. Calling HSTART here would trigger a premature transfer
+	 * with stale/empty BD addresses (host page table or audio buffer
+	 * not yet populated at trigger time) and generate an unhandled
+	 * interrupt on a channel that is NOT registered with the Zephyr
+	 * DMA domain (not a scheduling source) — leading to an IRQ storm
+	 * once the shared SDMA3 line is enabled by the DAI sdma_start.
+	 * The old dummy_dma_start was a no-op; we preserve that semantic
+	 * for AP2AP.
+	 */
+	if (pdata->sdma_chan_type != SDMA_CHAN_TYPE_AP2AP)
+		sdma_enable_channel(channel->dma, channel->index);
 
 	return 0;
 }
@@ -880,8 +893,6 @@ static int sdma_prep_desc(struct dma_chan_data *channel,
 
 		bd->config = SDMA_BD_COUNT(config->elem_array.elems[i].size) |
 			SDMA_BD_CMD(SDMA_CMD_XFER_SIZE(width));
-		if (!config->irq_disabled)
-			bd->config |= SDMA_BD_INT;
 
 		if (pdata->sdma_chan_type == SDMA_CHAN_TYPE_AP2AP) {
 			/* AP2AP one-shot memcpy: match Linux upstream
@@ -889,14 +900,25 @@ static int sdma_prep_desc(struct dma_chan_data *channel,
 			 * DONE (SDMA ready to run), LAST (mark end of chain
 			 * so the script clears DONE on completion). No CONT
 			 * (single BD only). WRAP added below.
+			 *
+			 * NEVER set SDMA_BD_INT for AP2AP: the channel is
+			 * polled synchronously in sdma_copy() and is not a
+			 * scheduling source, so its BD_INT would not be
+			 * cleared by the Zephyr DMA domain ISR — causing an
+			 * IRQ storm once the shared SDMA3 line is enabled by
+			 * DAI sdma_start.
 			 */
 			bd->config |= SDMA_BD_EXTD | SDMA_BD_DONE |
 				      SDMA_BD_LAST;
 		} else {
 			/* Cyclic DAI path (SHP2MCU/MCU2SHP): keep CONT so
 			 * SDMA continues into next BD. WRAP added below for
-			 * cyclic configs.
+			 * cyclic configs. BD_INT honors caller's irq_disabled
+			 * flag — DAI channels are scheduling sources, their
+			 * IRQs are properly cleared by the domain ISR.
 			 */
+			if (!config->irq_disabled)
+				bd->config |= SDMA_BD_INT;
 			bd->config |= SDMA_BD_CONT | SDMA_BD_DONE;
 		}
 	}
