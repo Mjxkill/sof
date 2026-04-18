@@ -6,48 +6,6 @@
 
 #include <sof/audio/component.h>
 #include <sof/drivers/sdma.h>
-
-/* Mini trace: 32 slots at 0x92C02780. Each slot = (ID<<24 | seq_number) */
-#define TRACE_BASE ((volatile uint32_t *)0x92C02780)
-#define TRACE_SEQ  ((volatile uint32_t *)0x92C027FC) /* slot 31 = seq counter */
-#define TRACE_EVT(id) do { \
-	uint32_t _s = (*TRACE_SEQ)++; \
-	if (_s < 31) TRACE_BASE[_s] = ((id) << 24) | (_s & 0xFFFFFF); \
-} while (0)
-
-#define T_PREP     0x01
-#define T_START    0x02
-#define T_STOP     0x03
-#define T_COPY     0x04
-#define T_GDS      0x05
-#define T_ISR      0x06
-
-/* AP2AP DEBUG instrumentation — temporary, Phase 2 hardware test.
- * Layout in SDRAM1 area (0x92C02C00-0x92C02CFF, 256 bytes):
- *   +0x00 : channel_get_total
- *   +0x04 : channel_get_ap2ap_returned (count of channels handed to host)
- *   +0x08 : read_config_total
- *   +0x0C : read_config_ap2ap          (HMEM/LMEM/M2M case taken)
- *   +0x10 : prep_desc_total
- *   +0x14 : prep_desc_ap2ap            (BD setup ran the AP2AP branch)
- *   +0x18 : set_config_total
- *   +0x1C : set_config_ap2ap_ok        (sdma_set_config returned OK for AP2AP)
- *   +0x20 : start_total
- *   +0x24 : start_ap2ap                (sdma_start called on an AP2AP chan)
- *   +0x28 : copy_total
- *   +0x2C : copy_ap2ap                 (sdma_copy called on an AP2AP chan)
- *   +0x30 : last_ap2ap_chan_index
- *   +0x34 : last_ap2ap_direction
- *   +0x38 : last_ap2ap_buf_addr        (src in BD)
- *   +0x3C : last_ap2ap_buf_xaddr       (dest in BD)
- *   +0x40 : last_ap2ap_size            (BD count = period bytes)
- *   +0x44 : last_ap2ap_burst_elems
- *   +0x48 : read_config_einval         (paths returning -EINVAL)
- *   +0x4C : last_einval_direction
- */
-#define APDBG ((volatile uint32_t *)0x92C02C00)
-#define APDBG_INC(off) do { APDBG[(off)/4]++; } while (0)
-#define APDBG_SET(off, v) do { APDBG[(off)/4] = (uint32_t)(v); } while (0)
 #include <rtos/timer.h>
 #include <rtos/alloc.h>
 #include <sof/lib/dma.h>
@@ -476,7 +434,6 @@ static struct dma_chan_data *sdma_channel_get(struct dma *dma,
 
 		/* Allow events, allow manual */
 		sdma_set_overrides(channel, false, false);
-		APDBG_INC(0x00); /* channel_get_total */
 		return channel;
 	}
 	tr_err(&sdma_tr, "sdma no channel free");
@@ -530,14 +487,7 @@ static void sdma_channel_put(struct dma_chan_data *channel)
 
 static int sdma_start(struct dma_chan_data *channel)
 {
-	struct sdma_chan *pdata = dma_chan_get_data(channel);
-
 	tr_dbg(&sdma_tr, "sdma_start(%d)", channel->index);
-
-	TRACE_EVT(T_START);
-	APDBG_INC(0x20); /* start_total */
-	if (pdata->sdma_chan_type == SDMA_CHAN_TYPE_AP2AP)
-		APDBG_INC(0x24); /* start_ap2ap */
 
 	if (channel->status != COMP_STATE_PREPARE &&
 	    channel->status != COMP_STATE_PAUSED)
@@ -556,8 +506,6 @@ static int sdma_start(struct dma_chan_data *channel)
 
 static int sdma_stop(struct dma_chan_data *channel)
 {
-	TRACE_EVT(T_STOP);
-
 	if (channel->status != COMP_STATE_ACTIVE &&
 	    channel->status != COMP_STATE_PAUSED)
 		return 0;
@@ -610,11 +558,6 @@ static int sdma_copy(struct dma_chan_data *channel, int bytes, uint32_t flags)
 	};
 
 	tr_dbg(&sdma_tr, "sdma_copy");
-
-	TRACE_EVT(T_COPY);
-	APDBG_INC(0x28); /* copy_total */
-	if (pdata->sdma_chan_type == SDMA_CHAN_TYPE_AP2AP)
-		APDBG_INC(0x2C); /* copy_ap2ap */
 
 	if (pdata->sdma_chan_type == SDMA_CHAN_TYPE_AP2AP) {
 		/* AP2AP is a ONE-SHOT memory-to-memory transfer with NO
@@ -796,8 +739,6 @@ static int sdma_read_config(struct dma_chan_data *channel,
 	int i;
 	struct sdma_chan *pdata = dma_chan_get_data(channel);
 
-	APDBG_INC(0x08); /* read_config_total */
-
 	/* Note: do NOT dereference channel->dev_data as dai_data at this
 	 * scope: for host (AP2AP) channels, dev_data is host_data, not
 	 * dai_data. The dai_data access must happen only in DEV cases.
@@ -830,14 +771,8 @@ static int sdma_read_config(struct dma_chan_data *channel,
 		pdata->sdma_chan_type = SDMA_CHAN_TYPE_AP2AP;
 		pdata->hw_event = -1;
 		pdata->fifo_paddr = 0;
-		APDBG_INC(0x0C); /* read_config_ap2ap */
-		APDBG_SET(0x30, channel->index); /* last_ap2ap_chan_index */
-		APDBG_SET(0x34, config->direction); /* last_ap2ap_direction */
-		APDBG_SET(0x44, config->burst_elems); /* last_ap2ap_burst_elems */
 		break;
 	default:
-		APDBG_INC(0x48); /* read_config_einval */
-		APDBG_SET(0x4C, config->direction); /* last_einval_direction */
 		tr_err(&sdma_tr, "sdma_set_config: Unsupported direction %d",
 		       config->direction);
 		return -EINVAL;
@@ -895,8 +830,6 @@ static int sdma_prep_desc(struct dma_chan_data *channel,
 	struct sdma_chan *pdata = dma_chan_get_data(channel);
 	struct sdma_bd *bd;
 
-	APDBG_INC(0x10); /* prep_desc_total */
-
 	/* Validate requested configuration */
 	if (config->elem_array.count > SDMA_MAX_BDS) {
 		tr_err(&sdma_tr, "sdma_set_config: Unable to handle %d descriptors",
@@ -911,17 +844,6 @@ static int sdma_prep_desc(struct dma_chan_data *channel,
 
 	pdata->next_bd = 0;
 	pdata->current_bd = 1; /* DMA starts on BD[0], host accesses BD[1] */
-
-	/* Clear trace buffer */
-	{
-		int _t;
-		for (_t = 0; _t < 32; _t++)
-			TRACE_BASE[_t] = 0;
-	}
-	TRACE_EVT(T_PREP);
-	/* Store BD[0] address for debug read from A53 */
-	(*(volatile uint32_t *)0x92C027D0) = (uint32_t)&pdata->desc[0];
-	(*(volatile uint32_t *)0x92C027D4) = (uint32_t)&pdata->desc[1];
 
 	bd = &pdata->desc[0];
 	width = 0;
@@ -946,10 +868,6 @@ static int sdma_prep_desc(struct dma_chan_data *channel,
 			bd->buf_addr = config->elem_array.elems[i].src;
 			bd->buf_xaddr = config->elem_array.elems[i].dest;
 			width = config->dest_width;
-			APDBG_INC(0x14); /* prep_desc_ap2ap */
-			APDBG_SET(0x38, bd->buf_addr); /* last src */
-			APDBG_SET(0x3C, bd->buf_xaddr); /* last dst */
-			APDBG_SET(0x40, config->elem_array.elems[i].size);
 			/* Null addresses are expected at host_params() time
 			 * (host page table not yet received). Accept silently;
 			 * sdma_copy() guards the actual transfer against null
@@ -1069,26 +987,18 @@ static int sdma_set_config(struct dma_chan_data *channel,
 	struct sdma_chan *pdata = dma_chan_get_data(channel);
 	int ret;
 
-	APDBG_INC(0x18); /* set_config_total */
-
 	tr_dbg(&sdma_tr, "sdma_set_config channel %d", channel->index);
 
 	ret = sdma_read_config(channel, config);
-	if (ret < 0) {
-		APDBG_SET(0x50, (uint32_t)ret); /* diag: read_config err */
+	if (ret < 0)
 		return ret;
-	}
-	APDBG_INC(0x54); /* past_read_config */
 
 	channel->is_scheduling_source = config->is_scheduling_source;
 	channel->direction = config->direction;
 
 	ret = sdma_prep_desc(channel, config);
-	if (ret < 0) {
-		APDBG_SET(0x58, (uint32_t)ret); /* diag: prep_desc err */
+	if (ret < 0)
 		return ret;
-	}
-	APDBG_INC(0x5C); /* past_prep_desc */
 
 	/* AP2AP is software-triggered (no HW event). The SDMA runnability
 	 * formula (TRM §7.2) requires (event_pending OR EVTOVR) to be true.
@@ -1106,11 +1016,9 @@ static int sdma_set_config(struct dma_chan_data *channel,
 	/* Upload context */
 	ret = sdma_upload_context(channel);
 	if (ret < 0) {
-		APDBG_SET(0x60, (uint32_t)ret); /* diag: upload_ctx err */
 		tr_err(&sdma_tr, "Unable to upload context, bailing");
 		return ret;
 	}
-	APDBG_INC(0x64); /* past_upload_context */
 
 	tr_dbg(&sdma_tr, "SDMA context uploaded");
 	/* Context uploaded, we can set up events now */
@@ -1120,9 +1028,6 @@ static int sdma_set_config(struct dma_chan_data *channel,
 	dma_reg_write(channel->dma, SDMA_CHNPRI(channel->index), SDMA_DEFPRI);
 
 	channel->status = COMP_STATE_PREPARE;
-
-	if (pdata->sdma_chan_type == SDMA_CHAN_TYPE_AP2AP)
-		APDBG_INC(0x1C); /* set_config_ap2ap_ok */
 
 	/* AP2AP: do NOT auto-start here. sdma_copy() kicks the channel
 	 * itself and waits synchronously for DONE (see the AP2AP branch
@@ -1196,8 +1101,6 @@ static int sdma_get_data_size(struct dma_chan_data *channel, uint32_t *avail,
 		*avail = *free = 0;
 		return -EINVAL;
 	}
-
-	TRACE_EVT(T_GDS);
 
 	/* Always exactly 1 period, tracked by current_bd */
 	result_data = pdata->desc[pdata->current_bd].config &
