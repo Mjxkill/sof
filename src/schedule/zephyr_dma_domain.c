@@ -63,6 +63,14 @@ struct zephyr_dma_domain_channel {
 	struct zephyr_dma_domain_irq *irq_data;
 	/* used to keep track of channels using the same INTID */
 	struct list_item list;
+	/* set by dma_irq_handler when THIS channel's IRQ fires, consumed
+	 * by zephyr_dma_domain_is_pending() when the matching pipe_task is
+	 * scheduled. Required for duplex: without per-channel filtering the
+	 * shared SDMA IRQ would wake every registered pipeline on every BD-
+	 * done event (TX and RX fire separately in SAI async mode), causing
+	 * each pipeline_task to run twice per audio period.
+	 */
+	bool pending;
 };
 
 struct zephyr_dma_domain_irq {
@@ -100,11 +108,15 @@ static int zephyr_dma_domain_unregister(struct ll_schedule_domain *domain,
 					uint32_t num_tasks);
 static void zephyr_dma_domain_task_cancel(struct ll_schedule_domain *domain,
 					  struct task *task);
+static bool zephyr_dma_domain_is_pending(struct ll_schedule_domain *domain,
+					 struct task *task,
+					 struct comp_dev **comp);
 
 static const struct ll_schedule_domain_ops zephyr_dma_domain_ops = {
 	.domain_register	= zephyr_dma_domain_register,
 	.domain_unregister	= zephyr_dma_domain_unregister,
-	.domain_task_cancel	= zephyr_dma_domain_task_cancel
+	.domain_task_cancel	= zephyr_dma_domain_task_cancel,
+	.domain_is_pending	= zephyr_dma_domain_is_pending,
 };
 
 struct ll_schedule_domain *zephyr_dma_domain_init(struct dma *dma_array,
@@ -164,20 +176,31 @@ static void dma_irq_handler(void *data)
 
 	/* go through each channel using the INTID which corresponds to the IRQ
 	 * that has been triggered. For each channel, we clear the IRQ bit, thus
-	 * stopping them from asserting the IRQ.
+	 * stopping them from asserting the IRQ. We also record which channel(s)
+	 * fired so zephyr_dma_domain_is_pending() can run only the matching
+	 * pipeline task(s) — required for duplex correctness on shared-IRQ
+	 * SDMA controllers (e.g. i.MX8MP SDMA3).
 	 */
+	bool any_fired = false;
+
 	list_for_item(i, &irq_data->channels) {
 		chan_data = container_of(i, struct zephyr_dma_domain_channel, list);
 
-		if (dma_interrupt_legacy(chan_data->channel, DMA_IRQ_STATUS_GET))
+		if (dma_interrupt_legacy(chan_data->channel, DMA_IRQ_STATUS_GET)) {
 			dma_interrupt_legacy(chan_data->channel, DMA_IRQ_CLEAR);
+			chan_data->pending = true;
+			any_fired = true;
+		}
 	}
 
 	/* clear IRQ - the mask argument is unused ATM */
 	interrupt_clear_mask(irq_data->intid, 0);
 
-	/* give resources to thread semaphore */
-	if (dt->handler)
+	/* only wake the scheduler thread if at least one of our channels
+	 * actually fired — avoids spurious wake-ups from unrelated IRQs
+	 * sharing the same INTID.
+	 */
+	if (any_fired && dt->handler)
 		k_sem_give(sem);
 }
 
@@ -624,4 +647,60 @@ static void zephyr_dma_domain_task_cancel(struct ll_schedule_domain *domain,
 		 */
 		k_sem_give(&dt->sem);
 	}
+}
+
+/*
+ * zephyr_dma_domain_is_pending — per-task filter for zephyr_ll_run
+ *
+ * The shared SDMA IRQ fires once per BD-done on any channel. Without
+ * this filter, zephyr_ll_run would execute every registered pipeline
+ * task on every wake-up, so in full duplex each pipeline runs twice per
+ * audio period (TX BD-done + RX BD-done) → 2× over-consumption of the
+ * ALSA ring buffer.
+ *
+ * We return true only when the channel bound to `task` (via
+ * zephyr_dma_domain_register) has its `pending` flag set by the IRQ
+ * handler. Matching is done by pointer equality on pipe_task so TX and
+ * RX pipelines, which each own their own registered channel, are
+ * isolated. Mixer topologies where several tasks share a sched_comp
+ * also return true, but only the channel-owning task consumes (clears)
+ * the pending flag — other tasks merely observe it and run alongside.
+ */
+static bool zephyr_dma_domain_is_pending(struct ll_schedule_domain *domain,
+					 struct task *task,
+					 struct comp_dev **comp)
+{
+	struct zephyr_dma_domain *zephyr_dma_domain = ll_sch_get_pdata(domain);
+	struct pipeline_task *pipe_task = pipeline_task_get(task);
+	struct zephyr_dma_domain_irq *irq_data;
+	struct zephyr_dma_domain_channel *chan_data;
+	struct list_item *i, *j;
+
+	list_for_item(i, &zephyr_dma_domain->irqs) {
+		irq_data = container_of(i, struct zephyr_dma_domain_irq, list);
+		list_for_item(j, &irq_data->channels) {
+			chan_data = container_of(j,
+				struct zephyr_dma_domain_channel, list);
+
+			if (!chan_data->pending)
+				continue;
+
+			/* Direct owner — consume flag and run. */
+			if (chan_data->pipe_task == pipe_task) {
+				chan_data->pending = false;
+				if (comp)
+					*comp = pipe_task->sched_comp;
+				return true;
+			}
+
+			/* Shared sched_comp (mixer case): run alongside
+			 * without consuming; the owner will clear later.
+			 */
+			if (chan_data->pipe_task->sched_comp ==
+			    pipe_task->sched_comp)
+				return true;
+		}
+	}
+
+	return false;
 }

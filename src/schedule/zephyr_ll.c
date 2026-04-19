@@ -200,6 +200,34 @@ static void zephyr_ll_run(void *data)
 			continue;
 		}
 
+		/* Per-task filter for domains that implement is_pending
+		 * (e.g. zephyr_dma_domain for SDMA scheduling). Tasks whose
+		 * scheduling-source channel didn't fire this IRQ are deferred
+		 * to the next wake-up. Without this, shared-IRQ DMA domains
+		 * would run every registered task on every IRQ — in full
+		 * duplex on i.MX8MP that doubles pipeline_task invocations
+		 * (TX BD-done and RX BD-done both fire per period).
+		 *
+		 * Domains that don't expose domain_is_pending (timer) keep
+		 * the previous "run every registered task each wake-up"
+		 * behaviour.
+		 */
+		if (sch->ll_domain->ops->domain_is_pending) {
+			struct comp_dev *sc = NULL;
+
+			if (!sch->ll_domain->ops->domain_is_pending(
+				    sch->ll_domain, task, &sc)) {
+				/* Move task to the temp list so the outer
+				 * loop progresses; it is moved back to
+				 * sch->tasks after the run cycle with state
+				 * unchanged.
+				 */
+				list_item_del(list);
+				list_item_append(list, &task_head);
+				continue;
+			}
+		}
+
 		pdata->run = true;
 		task->state = SOF_TASK_STATE_RUNNING;
 

@@ -491,7 +491,7 @@ config XTENSA_EXCLUSIVE
 
 config FORCE_DMA_COPY_WHOLE_BLOCK
 	bool
-	default y if MT8195
+	default y if MT8195 || IMX8M
 	default n
 	depends on HOST_PTABLE
 	help
