@@ -22,7 +22,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#if defined(__XCC__)
+#if CONFIG_IMX_SDMA
+#include <sof/drivers/memcpy_dma.h>
+#define STREAMCOPY_MEMCPY_DMA
+#elif defined(__XCC__)
 #include <xtensa/config/core-isa.h>
 # if XCHAL_HAVE_HIFI5
 #  define STREAMCOPY_HIFI5
@@ -185,7 +188,58 @@ void comp_get_copy_limits_frame_aligned(const struct comp_buffer *source,
 	cl->sink_bytes = cl->frames * cl->sink_frame_bytes;
 }
 
-#if defined(STREAMCOPY_HIFI5)
+#if defined(STREAMCOPY_MEMCPY_DMA)
+
+int audio_stream_copy(const struct audio_stream *source, uint32_t ioffset,
+		      struct audio_stream *sink, uint32_t ooffset, uint32_t samples)
+{
+	int ssize = audio_stream_sample_bytes(source); /* src fmt == sink fmt */
+	uint8_t *src = audio_stream_wrap(source, (uint8_t *)audio_stream_get_rptr(source) +
+					 ioffset * ssize);
+	uint8_t *snk = audio_stream_wrap(sink, (uint8_t *)audio_stream_get_wptr(sink) +
+					 ooffset * ssize);
+	size_t bytes = samples * ssize;
+	size_t bytes_src;
+	size_t bytes_snk;
+	size_t bytes_copied;
+
+	while (bytes) {
+		bytes_src = audio_stream_bytes_without_wrap(source, src);
+		bytes_snk = audio_stream_bytes_without_wrap(sink, snk);
+		bytes_copied = MIN(bytes_src, bytes_snk);
+		bytes_copied = MIN(bytes, bytes_copied);
+		memcpy_dma(snk, src, bytes_copied);
+		bytes -= bytes_copied;
+		src = audio_stream_wrap(source, src + bytes_copied);
+		snk = audio_stream_wrap(sink, snk + bytes_copied);
+	}
+
+	return samples;
+}
+
+void cir_buf_copy(void *src, void *src_addr, void *src_end, void *dst,
+		  void *dst_addr, void *dst_end, size_t byte_size)
+{
+	size_t bytes = byte_size;
+	size_t bytes_src;
+	size_t bytes_dst;
+	size_t bytes_copied;
+	uint8_t *in = (uint8_t *)src;
+	uint8_t *out = (uint8_t *)dst;
+
+	while (bytes) {
+		bytes_src = cir_buf_bytes_without_wrap(in, src_end);
+		bytes_dst = cir_buf_bytes_without_wrap(out, dst_end);
+		bytes_copied = MIN(bytes_src, bytes_dst);
+		bytes_copied = MIN(bytes, bytes_copied);
+		memcpy_dma(out, in, bytes_copied);
+		bytes -= bytes_copied;
+		in = cir_buf_wrap(in + bytes_copied, src_addr, src_end);
+		out = cir_buf_wrap(out + bytes_copied, dst_addr, dst_end);
+	}
+}
+
+#elif defined(STREAMCOPY_HIFI5)
 
 #include <xtensa/tie/xt_hifi5.h>
 

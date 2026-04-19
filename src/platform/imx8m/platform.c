@@ -8,6 +8,7 @@
 #include <sof/debug/debug.h>
 #include <rtos/interrupt.h>
 #include <sof/ipc/driver.h>
+#include <sof/drivers/memcpy_dma.h>
 #include <sof/drivers/mu.h>
 #include <rtos/timer.h>
 #include <sof/fw-ready-metadata.h>
@@ -183,6 +184,13 @@ int platform_init(struct sof *sof)
 
 	/* init DMA */
 	ret = dmac_init(sof);
+	if (ret < 0)
+		return -ENODEV;
+
+	/* Bring up the SDMA-backed memcpy primitive before any pipeline
+	 * task can run audio_stream_copy().
+	 */
+	ret = memcpy_dma_init();
 	if (ret < 0)
 		return -ENODEV;
 

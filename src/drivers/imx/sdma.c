@@ -5,7 +5,9 @@
 // Author: Paul Olaru <paul.olaru@nxp.com>
 
 #include <sof/audio/component.h>
+#include <sof/drivers/memcpy_dma.h>
 #include <sof/drivers/sdma.h>
+#include <rtos/spinlock.h>
 #include <rtos/timer.h>
 #include <rtos/alloc.h>
 #include <sof/lib/dma.h>
@@ -17,6 +19,7 @@
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 LOG_MODULE_REGISTER(sdma, CONFIG_SOF_LOG_LEVEL);
 
@@ -573,22 +576,15 @@ static int sdma_copy(struct dma_chan_data *channel, int bytes, uint32_t flags)
 	tr_dbg(&sdma_tr, "sdma_copy");
 
 	if (pdata->sdma_chan_type == SDMA_CHAN_TYPE_AP2AP) {
-		/* AP2AP is a ONE-SHOT memory-to-memory transfer with NO
-		 * peripheral event. We must: (1) kick the SDMA channel
-		 * manually, (2) wait synchronously for the BD DONE flag to
-		 * be cleared (i.e. the transfer to complete), (3) invalidate
-		 * the destination cache so the DSP reads fresh data, then
-		 * fire the notifier. This matches dummy_dma's synchronous
-		 * memcpy semantics — caller expects the data to be ready
-		 * when sdma_copy returns.
+		/* Delegate AP2AP to the single memcpy_dma primitive so every
+		 * SDMA memory-to-memory transfer in SOF goes through one code
+		 * path (kick, poll, cache maintenance). The caller's BD was
+		 * already programmed by sdma_prep_desc() via dma_set_config;
+		 * we just extract src/dst and fire the framework notifier
+		 * after completion.
 		 */
 		struct sdma_bd *bd = &pdata->desc[0];
-		int timeout_us = 10000; /* 10 ms — plenty for <= 64 KB */
 
-		/* Guard: skip the kick if addresses are invalid (happens
-		 * between hw_params and first trigger when the host page
-		 * table isn't populated yet).
-		 */
 		if (!bd->buf_addr || !bd->buf_xaddr) {
 			tr_warn(&sdma_tr,
 				"sdma_copy AP2AP skip null addr chan=%d",
@@ -596,45 +592,8 @@ static int sdma_copy(struct dma_chan_data *channel, int bytes, uint32_t flags)
 			return 0;
 		}
 
-		/* Re-arm DONE on the BD we are about to process.
-		 * dma_set_config (via sdma_prep_desc) already wrote the
-		 * new buf_addr / buf_xaddr / count.
-		 */
-		dcache_invalidate_region(&bd->config, sizeof(bd->config));
-		bd->config |= SDMA_BD_DONE;
-		dcache_writeback_region(&bd->config, sizeof(bd->config));
-
-		/* Kick the SDMA channel — AP2AP has no peripheral event */
-		sdma_enable_channel(channel->dma, channel->index);
-
-		/* Poll BD DONE bit. SDMA clears it when the transfer
-		 * finishes. The BD lives in DDR-cached memory, so we MUST
-		 * invalidate each iteration to observe hardware writes.
-		 */
-		while (timeout_us--) {
-			dcache_invalidate_region(&bd->config,
-						 sizeof(bd->config));
-			if (!(bd->config & SDMA_BD_DONE))
-				break;
-			wait_delay_us(1);
-		}
-
-		if (timeout_us <= 0) {
-			tr_err(&sdma_tr,
-			       "sdma_copy AP2AP timeout chan=%d src=0x%x dst=0x%x",
-			       channel->index,
-			       (unsigned int)bd->buf_addr,
-			       (unsigned int)bd->buf_xaddr);
-			sdma_disable_channel(channel->dma, channel->index);
-			return -ETIMEDOUT;
-		}
-
-		/* Transfer done — invalidate destination so DSP reads
-		 * fresh data (SDMA wrote it via the bus, bypassing the
-		 * DSP L1 cache).
-		 */
-		dcache_invalidate_region((void *)(uintptr_t)bd->buf_xaddr,
-					 bytes);
+		memcpy_dma((void *)(uintptr_t)bd->buf_xaddr,
+			   (const void *)(uintptr_t)bd->buf_addr, bytes);
 
 		notifier_event(channel, NOTIFIER_ID_DMA_COPY,
 			       NOTIFIER_TARGET_CORE_LOCAL, &next,
@@ -680,6 +639,11 @@ static int sdma_status(struct dma_chan_data *channel,
 	status->w_pos = 0;
 	status->r_pos = 0;
 	status->timestamp = sof_cycle_get_64();
+
+	/* CCB is updated by the SDMA hardware when it advances/wraps to
+	 * the next BD. Invalidate before reading current_bd_paddr.
+	 */
+	dcache_invalidate_region(pdata->ccb, sizeof(*pdata->ccb));
 
 	bd = (struct sdma_bd *)pdata->ccb->current_bd_paddr;
 
@@ -1124,6 +1088,16 @@ static int sdma_get_data_size(struct dma_chan_data *channel, uint32_t *avail,
 		return -EINVAL;
 	}
 
+	/* SDMA hardware writes the BD (clears DONE, updates count) via
+	 * the DDR bus, bypassing the DSP L1 cache. Invalidate before
+	 * reading so we observe the current hardware state, not a stale
+	 * cache line — otherwise dai_common_copy() receives a stale
+	 * free/avail and may compute copy_bytes=0, causing the DAI to
+	 * replay the same dma_buffer content for multiple periods.
+	 */
+	dcache_invalidate_region(&pdata->desc[pdata->current_bd],
+				 sizeof(pdata->desc[pdata->current_bd]));
+
 	/* Always exactly 1 period, tracked by current_bd */
 	result_data = pdata->desc[pdata->current_bd].config &
 		      SDMA_BD_COUNT_MASK;
@@ -1170,3 +1144,150 @@ const struct dma_ops sdma_ops = {
 	.get_attribute	= sdma_get_attribute,
 	.get_data_size	= sdma_get_data_size,
 };
+
+/* ============================================================
+ * memcpy_dma — the single SDMA-backed memcpy primitive.
+ *
+ * Every hardware-accelerated memory-to-memory transfer in SOF on
+ * i.MX8MP flows through this function: audio_stream_copy (DSP-local
+ * buffers) and sdma_copy() for DMA_DIR_*_MEM directions (host payload)
+ * both call memcpy_dma() to perform the actual copy.
+ *
+ * Implementation lives in sdma.c because it needs direct access to
+ * the channel's sdma_bd / sdma_chan internals — public DMA framework
+ * calls would loop back through sdma_copy.
+ *
+ * Cache maintenance:
+ *   - src+dst are written back before the kick so the SDMA bus master
+ *     reads the freshest DSP-L1 data.
+ *   - dst is invalidated after completion so the DSP reloads the
+ *     newly-written DDR data on the next read.
+ *
+ * A short spinlock serialises callers of the shared primitive. A
+ * small-size fallback (MEMCPY_DMA_MIN_BYTES) skips the hardware path
+ * when setup overhead exceeds the cost of a CPU memcpy.
+ * ============================================================ */
+
+static struct memcpy_dma_ctx {
+	struct dma *dmac;
+	struct dma_chan_data *chan;
+	struct sdma_chan *pdata;
+	struct k_spinlock lock;
+	bool ready;
+} g_memcpy;
+
+int memcpy_dma_init(void)
+{
+	struct dma_sg_elem elem;
+	struct dma_sg_config cfg;
+	int ret;
+
+	if (g_memcpy.ready)
+		return 0;
+
+	k_spinlock_init(&g_memcpy.lock);
+
+	g_memcpy.dmac = dma_get(DMA_DIR_MEM_TO_MEM, 0, DMA_DEV_HOST,
+				DMA_ACCESS_SHARED);
+	if (!g_memcpy.dmac) {
+		tr_err(&sdma_tr, "memcpy_dma_init: no MEM_TO_MEM dmac");
+		return -ENODEV;
+	}
+
+	g_memcpy.chan = dma_channel_get_legacy(g_memcpy.dmac, 0);
+	if (!g_memcpy.chan) {
+		tr_err(&sdma_tr, "memcpy_dma_init: no channel");
+		return -ENODEV;
+	}
+
+	/* Configure the channel with placeholder AP2AP BDs. sdma_prep_desc
+	 * sets the script address, flags (EXTD|DONE|LAST|WRAP) and command;
+	 * memcpy_dma() reuses this setup and only rewrites buf_addr /
+	 * buf_xaddr / count on each call.
+	 */
+	elem.src = 0;
+	elem.dest = 0;
+	elem.size = 4;
+
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.direction = DMA_DIR_MEM_TO_MEM;
+	cfg.src_width = 4;
+	cfg.dest_width = 4;
+	cfg.cyclic = 0;
+	cfg.irq_disabled = true;
+	cfg.elem_array.elems = &elem;
+	cfg.elem_array.count = 1;
+
+	ret = dma_set_config_legacy(g_memcpy.chan, &cfg);
+	if (ret < 0) {
+		tr_err(&sdma_tr, "memcpy_dma_init: set_config failed %d",
+		       ret);
+		dma_channel_put_legacy(g_memcpy.chan);
+		g_memcpy.chan = NULL;
+		return ret;
+	}
+
+	g_memcpy.pdata = dma_chan_get_data(g_memcpy.chan);
+	g_memcpy.ready = true;
+	tr_info(&sdma_tr, "memcpy_dma ready (chan=%d)", g_memcpy.chan->index);
+	return 0;
+}
+
+void *memcpy_dma(void *dst, const void *src, size_t bytes)
+{
+	struct sdma_bd *bd;
+	k_spinlock_key_t key;
+	int timeout_us;
+
+	if (!bytes)
+		return dst;
+
+	/* Small-size fallback: the SDMA setup + double cache maintenance
+	 * costs more than a direct CPU copy below this threshold.
+	 */
+	if (!g_memcpy.ready || bytes < MEMCPY_DMA_MIN_BYTES)
+		return memcpy(dst, src, bytes);
+
+	/* Flush both src and dst to DDR so the SDMA bus master sees
+	 * a consistent view (no stale dirty lines hiding in DSP L1).
+	 */
+	dcache_writeback_region((void *)src, bytes);
+	dcache_writeback_region(dst, bytes);
+
+	key = k_spin_lock(&g_memcpy.lock);
+
+	bd = &g_memcpy.pdata->desc[0];
+	bd->buf_addr = (uint32_t)(uintptr_t)src;
+	bd->buf_xaddr = (uint32_t)(uintptr_t)dst;
+	bd->config = (bd->config & ~SDMA_BD_COUNT_MASK) | SDMA_BD_COUNT(bytes);
+	bd->config |= SDMA_BD_DONE;
+	dcache_writeback_region(bd, sizeof(*bd));
+
+	sdma_enable_channel(g_memcpy.chan->dma, g_memcpy.chan->index);
+
+	/* Poll BD.DONE. 2 ms is ~200x the expected worst case
+	 * (48 KB @ ~200 MB/s effective SDMA bandwidth ~= 250 us).
+	 */
+	timeout_us = 2000;
+	while (timeout_us--) {
+		dcache_invalidate_region(&bd->config, sizeof(bd->config));
+		if (!(bd->config & SDMA_BD_DONE))
+			break;
+		wait_delay_us(1);
+	}
+
+	k_spin_unlock(&g_memcpy.lock, key);
+
+	if (timeout_us <= 0) {
+		tr_err(&sdma_tr, "memcpy_dma timeout dst=0x%p src=0x%p n=%u",
+		       dst, src, (unsigned int)bytes);
+		sdma_disable_channel(g_memcpy.chan->dma, g_memcpy.chan->index);
+		return memcpy(dst, src, bytes);
+	}
+
+	/* dst was written by the SDMA bus bypassing the DSP cache —
+	 * invalidate so subsequent DSP reads pull the fresh data.
+	 */
+	dcache_invalidate_region(dst, bytes);
+	return dst;
+}
