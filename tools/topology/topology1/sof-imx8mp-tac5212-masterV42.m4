@@ -28,7 +28,7 @@ include(`platform/imx/imx8.m4')
 #
 PIPELINE_PCM_ADD(sof/sof-imx8mp-tac5212-pipe-effects-capture.m4,
 	1, 0, 8, s32le,
-	1000, 0, 0,
+	2000, 0, 0,
 	48000, 48000, 48000,
 	SCHEDULE_TIME_DOMAIN_DMA)
 
@@ -37,7 +37,7 @@ PIPELINE_PCM_ADD(sof/sof-imx8mp-tac5212-pipe-effects-capture.m4,
 #
 PIPELINE_PCM_ADD(sof/sof-imx8mp-tac5212-pipe-effects-playback.m4,
 	6, 1, 8, s32le,
-	1000, 0, 0,
+	2000, 0, 0,
 	48000, 48000, 48000,
 	SCHEDULE_TIME_DOMAIN_DMA)
 
@@ -48,12 +48,12 @@ PIPELINE_PCM_ADD(sof/sof-imx8mp-tac5212-pipe-effects-playback.m4,
 DAI_ADD(sof/pipe-dai-capture.m4,
 	1, SAI, 7, tac5212-hifi,
 	PIPELINE_SINK_1, 2, s32le,
-	1000, 0, 0, SCHEDULE_TIME_DOMAIN_DMA)
+	2000, 0, 0, SCHEDULE_TIME_DOMAIN_DMA)
 
 DAI_ADD(sof/pipe-dai-playback.m4,
 	6, SAI, 7, tac5212-hifi,
 	PIPELINE_SOURCE_6, 2, s32le,
-	1000, 0, 0, SCHEDULE_TIME_DOMAIN_DMA)
+	2000, 0, 0, SCHEDULE_TIME_DOMAIN_DMA)
 
 #
 # PCM ALSA exports : 2 PCMs en MVP (SAI_Capture, SAI_Playback)
