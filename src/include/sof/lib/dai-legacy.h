@@ -201,6 +201,12 @@ struct dai_data {
 
 	/* llp slot info in memory windows */
 	struct llp_slot_info slot_info;
+
+	/* V3.2.2 NPU tap (i.MX8MP) — see sof/audio/npu_tap.h */
+	void *tap_buffer;		/* ptr direct vers reserved-mem @0x942B0000, NULL = disabled */
+	uint32_t tap_buffer_size;	/* NPU_TAP_RING_SIZE if active, 0 otherwise */
+	uint32_t tap_period_bytes;	/* sanity check, normalement = period_bytes */
+	uint32_t tap_epoch;		/* monotonic, ++ at each dai_common_params (R1) */
 };
 
 struct dai {

@@ -8,6 +8,7 @@
 #include <sof/audio/buffer.h>
 #include <sof/audio/component_ext.h>
 #include <sof/audio/format.h>
+#include <sof/audio/npu_tap.h>
 #include <sof/audio/pipeline.h>
 #include <sof/common.h>
 #include <rtos/panic.h>
@@ -44,6 +45,11 @@ DECLARE_SOF_RT_UUID("dai", dai_comp_uuid, 0xc2b00d27, 0xffbc, 0x4150,
 		 0xa5, 0x1a, 0x24, 0x5c, 0x79, 0xc5, 0xe5, 0x4b);
 
 DECLARE_TR_CTX(dai_comp_tr, SOF_UUID(dai_comp_uuid), LOG_LEVEL_INFO);
+
+/* V3.2.2 NPU tap (R7) — mono-DAI ownership sentinel.
+ * Single-core CONFIG_CORE_COUNT=1 → no atomic/spinlock required.
+ */
+struct dai_data *npu_tap_owner;
 
 #if CONFIG_COMP_DAI_GROUP
 
@@ -147,6 +153,88 @@ static void dai_dma_cb(void *arg, enum notify_id type, void *data)
 	} else {
 		/* update host position (in bytes offset) for drivers */
 		dd->total_data_processed += bytes;
+
+		/*
+		 * V3.2.2 NPU tap : copie post-DRC du dma_buffer (OCRAM) vers
+		 * shared ring buffer (SDRAM @0x942B0000) pour analyse NPU A53.
+		 * Conditions A3+A6 : direction PLAYBACK, dma_buffer_copy_to OK,
+		 * tap_buffer non-NULL (R7 sentinelle peut le NULLifier),
+		 * bytes valide (A6 overflow guard via hdr->ring_size).
+		 */
+		if (dev->direction == SOF_IPC_STREAM_PLAYBACK &&
+		    dd->tap_buffer && bytes > 0) {
+			struct npu_tap_hdr *hdr =
+				(struct npu_tap_hdr *)dd->tap_buffer;
+			uint8_t *data_base = (uint8_t *)dd->tap_buffer +
+					     NPU_TAP_HDR_SIZE;
+			uint32_t ring_size = hdr->ring_size;	/* R6 runtime */
+			uint32_t w = hdr->write_idx;
+
+			if (bytes <= ring_size) {		/* A6 guard */
+				/* A4 : back-walk to source start (post-produce) */
+				struct audio_stream *stream =
+					&dd->dma_buffer->stream;
+				void *src =
+					audio_stream_rewind_wptr_by_bytes(stream,
+									  bytes);
+				uint32_t src_to_end =
+					audio_stream_bytes_without_wrap(stream,
+									src);
+				uint32_t src_head = MIN(bytes, src_to_end);
+				uint32_t src_tail = bytes - src_head;
+				uint32_t tap_to_end = ring_size - w;
+				uint32_t head_in_tap = MIN(src_head, tap_to_end);
+
+				/* Tap ring write — wrap × 2 (src + tap) */
+				memcpy_s(data_base + w, ring_size - w,
+					 src, head_in_tap);
+				if (src_head > tap_to_end)
+					memcpy_s(data_base, ring_size,
+						 (uint8_t *)src + tap_to_end,
+						 src_head - tap_to_end);
+
+				if (src_tail) {
+					void *src2 =
+						audio_stream_get_addr(stream);
+					uint32_t new_w = (w + src_head)
+							 % ring_size;
+					uint32_t tap_to_end2 = ring_size - new_w;
+					uint32_t tail_in_tap =
+						MIN(src_tail, tap_to_end2);
+
+					memcpy_s(data_base + new_w,
+						 ring_size - new_w,
+						 src2, tail_in_tap);
+					if (src_tail > tap_to_end2)
+						memcpy_s(data_base, ring_size,
+							 (uint8_t *)src2
+							  + tap_to_end2,
+							 src_tail - tap_to_end2);
+				}
+
+				/* A5 : flush DATA before write_idx
+				 * (pattern sdma.c, defensive on WT cacheattr)
+				 */
+				dcache_writeback_region(
+					(__sparse_force void __sparse_cache *)
+					(data_base + w),
+					MIN(bytes, ring_size - w));
+				if (bytes > ring_size - w)
+					dcache_writeback_region(
+						(__sparse_force void __sparse_cache *)
+						data_base,
+						bytes - (ring_size - w));
+
+				__asm__ volatile("memw" ::: "memory");
+
+				hdr->write_idx = (w + bytes) % ring_size;
+				dcache_writeback_region(
+					(__sparse_force void __sparse_cache *)
+					&hdr->write_idx,
+					sizeof(hdr->write_idx));
+				__asm__ volatile("memw" ::: "memory");
+			}
+		}
 	}
 }
 
@@ -590,6 +678,83 @@ int dai_common_params(struct dai_data *dd, struct comp_dev *dev,
 				  BUFFER_UPDATE_FORCE);
 	}
 
+	/*
+	 * V3.2.2 NPU tap init / reset header (R3 ordering canonique
+	 * data state FIRST, version PUBLISH LAST + M5 magic handshake).
+	 * R7 sentinelle mono-DAI : 1er DAI playback prend ownership.
+	 */
+	if (dev->direction == SOF_IPC_STREAM_PLAYBACK) {
+		if (!npu_tap_owner) {
+			npu_tap_owner = dd;
+		} else if (npu_tap_owner != dd) {
+			comp_warn(dev,
+				  "NPU tap already owned by another DAI, this DAI disabled");
+			dd->tap_buffer = NULL;
+			dd->tap_buffer_size = 0;
+			dd->tap_period_bytes = 0;
+			goto skip_npu_tap_init;
+		}
+		/* npu_tap_owner == dd : first init or re-prepare (idempotent) */
+
+		dd->tap_buffer = (void *)(uintptr_t)NPU_TAP_PHYS_ADDR;
+		dd->tap_buffer_size = NPU_TAP_RING_SIZE;
+		dd->tap_period_bytes = period_bytes;
+
+		struct npu_tap_hdr *hdr =
+			(struct npu_tap_hdr *)dd->tap_buffer;
+		uint32_t aligned_ring_size =
+			(NPU_TAP_DATA_SIZE_MAX / period_bytes) * period_bytes;
+
+		/* M5 step 1 : invalidate magic FIRST so A53 rejects header during init */
+		hdr->magic = 0u;
+		dcache_writeback_region(
+			(__sparse_force void __sparse_cache *)&hdr->magic,
+			sizeof(hdr->magic));
+		__asm__ volatile("memw" ::: "memory");
+
+		/* Step 2 : zero-init the rest (covers reserved[]) */
+		memset(((uint8_t *)hdr) + sizeof(uint32_t), 0,
+		       sizeof(*hdr) - sizeof(uint32_t));
+
+		/* Step 3 : data state — A2 idempotent reset, R3 data first */
+		hdr->version = 4;			/* V3.2.2 */
+		hdr->ring_size = aligned_ring_size;	/* R6 runtime */
+		hdr->hdr_size = NPU_TAP_HDR_SIZE;	/* 128 (M2) */
+		hdr->write_idx = 0;
+		hdr->read_idx = 0;
+		hdr->period_bytes = period_bytes;
+		hdr->sample_rate = 48000;
+		hdr->channels = 8;
+		hdr->frame_fmt = SOF_IPC_FRAME_S32_LE;
+
+		/* Step 4 : flush data state (everything BEFORE epoch) */
+		dcache_writeback_region(
+			(__sparse_force void __sparse_cache *)hdr,
+			offsetof(struct npu_tap_hdr, epoch));
+
+		/* Step 5 : memw barrier */
+		__asm__ volatile("memw" ::: "memory");
+
+		/* Step 6 : publish epoch (R1 monotonic + R3 ordering) */
+		hdr->epoch = ++dd->tap_epoch;
+		dcache_writeback_region(
+			(__sparse_force void __sparse_cache *)&hdr->epoch,
+			sizeof(hdr->epoch));
+		__asm__ volatile("memw" ::: "memory");
+
+		/* M5 step 7 : publish magic LAST — A53 trusts header iff magic == NPAT */
+		hdr->magic = NPU_TAP_MAGIC;
+		dcache_writeback_region(
+			(__sparse_force void __sparse_cache *)&hdr->magic,
+			sizeof(hdr->magic));
+		__asm__ volatile("memw" ::: "memory");
+
+		comp_info(dev,
+			  "NPU tap init: epoch=%u ring_size=%u period_bytes=%u",
+			  dd->tap_epoch, aligned_ring_size, period_bytes);
+	}
+skip_npu_tap_init:
+
 	return dev->direction == SOF_IPC_STREAM_PLAYBACK ?
 		dai_playback_params(dev, period_bytes, period_count) :
 		dai_capture_params(dev, period_bytes, period_count);
@@ -713,6 +878,20 @@ static int dai_prepare(struct comp_dev *dev)
 void dai_common_reset(struct dai_data *dd, struct comp_dev *dev)
 {
 	struct dma_sg_config *config = &dd->config;
+
+	/*
+	 * V3.2.2 NPU tap (A1) — NULLify tap_buffer FIRST, before releasing DMA.
+	 * The hook in dai_dma_cb() checks dd->tap_buffer != NULL ; setting it
+	 * NULL here ensures any in-flight callback skips the memcpy_s and
+	 * doesn't write to a buffer about to be freed.
+	 * R7 — release the global ownership if we're the owner.
+	 */
+	dd->tap_buffer = NULL;
+	dd->tap_buffer_size = 0;
+	dd->tap_period_bytes = 0;
+	/* dd->tap_epoch is monotonic for the life of this dai_data — not reset */
+	if (npu_tap_owner == dd)
+		npu_tap_owner = NULL;
 
 	/*
 	 * DMA channel release should be skipped now for DAI's that support the two-step stop option.
