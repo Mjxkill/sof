@@ -682,8 +682,13 @@ int dai_common_params(struct dai_data *dd, struct comp_dev *dev,
 	 * V3.2.2 NPU tap init / reset header (R3 ordering canonique
 	 * data state FIRST, version PUBLISH LAST + M5 magic handshake).
 	 * R7 sentinelle mono-DAI : 1er DAI playback prend ownership.
+	 *
+	 * Defensive : period_bytes==0 (cas pathologique) ⇒ skip tap init pour
+	 * éviter divide-by-zero dans (NPU_TAP_DATA_SIZE_MAX / period_bytes).
+	 * Normalement period_bytes > 0 (calculé depuis PCM hw_params), mais
+	 * protection en profondeur (issue critic_review turn 188 sev=medium).
 	 */
-	if (dev->direction == SOF_IPC_STREAM_PLAYBACK) {
+	if (dev->direction == SOF_IPC_STREAM_PLAYBACK && period_bytes > 0) {
 		if (!npu_tap_owner) {
 			npu_tap_owner = dd;
 		} else if (npu_tap_owner != dd) {
