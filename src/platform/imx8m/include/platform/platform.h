@@ -41,7 +41,7 @@ struct timer;
  * still possible to have multiple SAI peripherals output 8 channels each.
  */
 #define PLATFORM_MAX_CHANNELS   8
-#define PLATFORM_MAX_STREAMS	8
+#define PLATFORM_MAX_STREAMS	16	/* V5.4.1: 8->16 for V5.4.1 (1 capture 8ch + 8 playback mono = 9 PCM streams) */
 
 /* local buffer size of DMA tracing */
 #define DMA_TRACE_LOCAL_SIZE	HOST_PAGE_SIZE

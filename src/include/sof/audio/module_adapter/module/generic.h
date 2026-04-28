@@ -30,7 +30,7 @@
 #define IS_PROCESSING_MODE_SINK_SOURCE(mod) ((mod)->proc_type == MODULE_PROCESS_TYPE_SOURCE_SINK)
 
 #define MAX_BLOB_SIZE 8192
-#define MODULE_MAX_SOURCES 8
+#define MODULE_MAX_SOURCES 16	/* V5.4.1: 8->16 for mixer16 (16 source matrix). Existing comps still default max_sources/sinks=1. */
 
 #define API_CALL(cd, cmd, sub_cmd, value, ret) \
 	do { \
