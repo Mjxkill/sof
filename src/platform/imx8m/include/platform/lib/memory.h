@@ -32,6 +32,13 @@
 #define SDRAM1_BASE	0x92C00000
 #define SDRAM1_SIZE	0x800000
 
+/* V5.4.1 Phase 1a.3 — DSP-only DDR carve-out for matrix/effects buffers.
+ * 8 MB no-map carve in DT (sdram2_reserved@a0000000); WT cache via cacheattr
+ * region 5 (digit 5 of _memmap_cacheattr_imx8_wt_allvalid: 2->1).
+ */
+#define SDRAM2_BASE	0xA0000000
+#define SDRAM2_SIZE	0x800000
+
 #define XSHAL_MU2_SIDEB_BYPASS_PADDR 0x30E70000
 #define MU_BASE		XSHAL_MU2_SIDEB_BYPASS_PADDR
 
@@ -183,7 +190,7 @@
 #define PLATFORM_HEAP_SYSTEM		1 /* one per core */
 #define PLATFORM_HEAP_SYSTEM_RUNTIME	1 /* one per core */
 #define PLATFORM_HEAP_RUNTIME		1
-#define PLATFORM_HEAP_BUFFER		3
+#define PLATFORM_HEAP_BUFFER		4	/* V5.4.1: +SDRAM2 buffer[3] */
 
 /* Stack configuration */
 #define SOF_STACK_SIZE		(CONFIG_SOF_STACK_SIZE)

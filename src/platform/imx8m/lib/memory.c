@@ -66,6 +66,14 @@ static SHARED_DATA struct block_map hp_tx_heap_map[] = {
 	BLOCK_DEF(HEAP_HP_TX_BLOCK_SIZE, HEAP_HP_TX_COUNT, hp_tx_block),
 };
 
+/* V5.4.1 Phase 1a.3 — DSP-only SDRAM2 carve-out for matrix/effects buffers */
+#define HEAP_SDRAM2_BLOCK_SIZE		0x100
+#define HEAP_SDRAM2_COUNT		(SDRAM2_SIZE / HEAP_SDRAM2_BLOCK_SIZE)
+static SHARED_DATA struct block_hdr sdram2_block[HEAP_SDRAM2_COUNT];
+static SHARED_DATA struct block_map sdram2_heap_map[] = {
+	BLOCK_DEF(HEAP_SDRAM2_BLOCK_SIZE, HEAP_SDRAM2_COUNT, sdram2_block),
+};
+
 static SHARED_DATA struct mm memmap = {
 	.system[0] = {
 		.heap = HEAP_SYSTEM_BASE,
@@ -119,9 +127,19 @@ static SHARED_DATA struct mm memmap = {
 		.caps = SOF_MEM_CAPS_RAM | SOF_MEM_CAPS_DMA |
 			SOF_MEM_CAPS_HP,
 	},
+	.buffer[3] = {
+		.blocks = ARRAY_SIZE(sdram2_heap_map),
+		.map = sdram2_heap_map,
+		.heap = SDRAM2_BASE,
+		.size = SDRAM2_SIZE,
+		.info = {.free = SDRAM2_SIZE,},
+		.caps = SOF_MEM_CAPS_RAM | SOF_MEM_CAPS_CACHE |
+			SOF_MEM_CAPS_DMA,
+	},
 	.total = {.free = HEAP_SYSTEM_SIZE + HEAP_SYS_RUNTIME_SIZE +
 			HEAP_RUNTIME_SIZE + HEAP_BUFFER_SIZE +
-			HEAP_HP_RX_SIZE + HEAP_HP_TX_SIZE,},
+			HEAP_HP_RX_SIZE + HEAP_HP_TX_SIZE +
+			SDRAM2_SIZE,},
 };
 
 void platform_init_memmap(struct sof *sof)

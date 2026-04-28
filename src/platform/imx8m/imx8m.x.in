@@ -90,6 +90,9 @@ MEMORY
   sof_sdram1 :
         org = SDRAM1_BASE,
         len = SDRAM1_SIZE
+  sof_sdram2 :
+        org = SDRAM2_BASE,
+        len = SDRAM2_SIZE
   static_uuid_entries_seg (!ari) :
         org = UUID_ENTRY_ELF_BASE,
         len = UUID_ENTRY_ELF_SIZE
@@ -163,7 +166,7 @@ _memmap_cacheattr_bp_allvalid = 0x22222222;
  * 4: write back
  * F: invalid access
  */
-_memmap_cacheattr_imx8_wt_allvalid = 0x22212222;
+_memmap_cacheattr_imx8_wt_allvalid = 0x22112222;	/* V5.4.1: digit 5 (region 5 0xA0000000-0xBFFFFFFF) 2->1 = WT for SDRAM2 */
 PROVIDE(_memmap_cacheattr_reset = _memmap_cacheattr_imx8_wt_allvalid);
 
 _EXT_MAN_ALIGN_ = 16;
