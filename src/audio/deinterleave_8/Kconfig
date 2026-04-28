@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+config COMP_DEINTERLEAVE_8
+	bool "Deinterleave 1×8ch -> 8 mono component (V5.4.1 Phase 1a.3)"
+	default n
+	help
+	  Split 1 source 8-channel interleaved S32_LE into 8 mono sinks.
+	  Used at start of V5.4.1 input chain (SAI7 RX 8ch -> 8 strips IN mono).
+	  Symetric pattern to interleave_8. SOURCE_SINK mode.
