@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+config COMP_INTERLEAVE_8
+	bool "Interleave 8 mono -> 1x8ch component (V5.4.1 Phase 1a.3)"
+	default n
+	help
+	  Concatenate 8 mono sources into a single 8-channel interleaved
+	  S32_LE sink. Used at end of V5.4.1 output chain to deliver 8
+	  channels to SAI7 TX (NPU tap V3.2.2 invariant: period_bytes=3072).
+	  SOURCE_SINK mode. Skeleton at E1 — full memcpy stride at E2.

@@ -637,6 +637,19 @@ zephyr_library_sources_ifdef(CONFIG_COMP_VOLUME
 	${SOF_AUDIO_PATH}/volume/volume_${ipc_suffix}.c
 )
 
+# V5.4.1 Phase 1a.3 — new components for matrix routing
+zephyr_library_sources_ifdef(CONFIG_COMP_TEE_1TO2
+	${SOF_AUDIO_PATH}/tee_1to2/tee_1to2.c
+)
+
+zephyr_library_sources_ifdef(CONFIG_COMP_MIXER16
+	${SOF_AUDIO_PATH}/mixer16/mixer16.c
+)
+
+zephyr_library_sources_ifdef(CONFIG_COMP_INTERLEAVE_8
+	${SOF_AUDIO_PATH}/interleave_8/interleave_8.c
+)
+
 zephyr_library_sources_ifdef(CONFIG_COMP_MODULE_ADAPTER
 	${SOF_AUDIO_PATH}/module_adapter/module_adapter.c
 	${SOF_AUDIO_PATH}/module_adapter/module_adapter_${ipc_suffix}.c

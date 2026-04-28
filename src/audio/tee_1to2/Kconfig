@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+config COMP_TEE_1TO2
+	bool "TEE 1-to-2 fan-out component (V5.4.1 Phase 1a.3)"
+	default n
+	help
+	  Minimal fan-out component for V5.4.1 channel-strip post-IN duplication.
+	  1 mono source -> 2 mono sinks (identical content). STREAM mode.
+	  Used to split each input channel-strip into matrix-input + capture-host
+	  branches (V5.4.1 §2 fan-out post-strip-IN).

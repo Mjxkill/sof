@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+config COMP_MIXER16
+	bool "Mixer 16x8 matrix component (V5.4.1 Phase 1a.3)"
+	default n
+	help
+	  16-source x 8-sink matrix mixer with per-cell Q1.31 gains.
+	  Used for V5.4.1 routing matrix between input strips and output
+	  strips (8 mics + 8 ASIO playback hosts -> 8 strip OUT). SOURCE_SINK
+	  mode (proc_type=SOURCE_SINK). 128 gain cells exposed as ALSA bytes
+	  blob (512 B). Requires MODULE_MAX_SOURCES >= 16 (C14).
+	  Skeleton only at E1 — full mix loop at E2.
