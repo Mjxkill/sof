@@ -1,0 +1,116 @@
+# V5.4.1 Phase 1a.3 E5.a — pipe capture round-trip deinterleave_8 + interleave_8
+#
+# Pipeline : SAI capture 8ch → B0 → deinterleave_8 → B1..B8 (8 mono) → interleave_8 → B9 → host PCM
+#
+# Test runtime : valider que deinterleave_8 + interleave_8 chained produisent
+# en sortie un PCM 8ch identique (ou très proche) au PCM SAI in.
+# Si arecord 8ch lit des samples cohérents = round-trip valide les 2 NEW comps.
+
+include(`utils.m4')
+include(`buffer.m4')
+include(`pcm.m4')
+include(`dai.m4')
+include(`pipeline.m4')
+
+# V5.4.1 NEW comp widgets
+include(`deinterleave_8.m4')
+include(`interleave_8.m4')
+
+#
+# Components and Buffers
+#
+
+# Host "Round-trip Capture" PCM (8ch)
+W_PCM_CAPTURE(PCM_ID, Round-trip Capture, 0, 2, SCHEDULE_CORE)
+
+# deinterleave_8 (1 src 8ch → 8 sinks mono)
+W_DEINTERLEAVE_8(0, PIPELINE_FORMAT, 2, 2, SCHEDULE_CORE)
+
+# interleave_8 (8 sources mono → 1 sink 8ch)
+W_INTERLEAVE_8(0, PIPELINE_FORMAT, 2, 2, SCHEDULE_CORE)
+
+# Buffers
+# B0: post-DAI 8ch
+W_BUFFER(0, COMP_BUFFER_SIZE(DAI_PERIODS,
+	COMP_SAMPLE_SIZE(PIPELINE_FORMAT), PIPELINE_CHANNELS,
+	COMP_PERIOD_FRAMES(PCM_MAX_RATE, SCHEDULE_PERIOD)),
+	PLATFORM_DAI_MEM_CAP)
+
+# B1..B8 : 8 buffers mono entre deinterleave_8 et interleave_8
+W_BUFFER(1, COMP_BUFFER_SIZE(2,
+	COMP_SAMPLE_SIZE(PIPELINE_FORMAT), 1,
+	COMP_PERIOD_FRAMES(PCM_MAX_RATE, SCHEDULE_PERIOD)),
+	PLATFORM_HOST_MEM_CAP)
+W_BUFFER(2, COMP_BUFFER_SIZE(2,
+	COMP_SAMPLE_SIZE(PIPELINE_FORMAT), 1,
+	COMP_PERIOD_FRAMES(PCM_MAX_RATE, SCHEDULE_PERIOD)),
+	PLATFORM_HOST_MEM_CAP)
+W_BUFFER(3, COMP_BUFFER_SIZE(2,
+	COMP_SAMPLE_SIZE(PIPELINE_FORMAT), 1,
+	COMP_PERIOD_FRAMES(PCM_MAX_RATE, SCHEDULE_PERIOD)),
+	PLATFORM_HOST_MEM_CAP)
+W_BUFFER(4, COMP_BUFFER_SIZE(2,
+	COMP_SAMPLE_SIZE(PIPELINE_FORMAT), 1,
+	COMP_PERIOD_FRAMES(PCM_MAX_RATE, SCHEDULE_PERIOD)),
+	PLATFORM_HOST_MEM_CAP)
+W_BUFFER(5, COMP_BUFFER_SIZE(2,
+	COMP_SAMPLE_SIZE(PIPELINE_FORMAT), 1,
+	COMP_PERIOD_FRAMES(PCM_MAX_RATE, SCHEDULE_PERIOD)),
+	PLATFORM_HOST_MEM_CAP)
+W_BUFFER(6, COMP_BUFFER_SIZE(2,
+	COMP_SAMPLE_SIZE(PIPELINE_FORMAT), 1,
+	COMP_PERIOD_FRAMES(PCM_MAX_RATE, SCHEDULE_PERIOD)),
+	PLATFORM_HOST_MEM_CAP)
+W_BUFFER(7, COMP_BUFFER_SIZE(2,
+	COMP_SAMPLE_SIZE(PIPELINE_FORMAT), 1,
+	COMP_PERIOD_FRAMES(PCM_MAX_RATE, SCHEDULE_PERIOD)),
+	PLATFORM_HOST_MEM_CAP)
+W_BUFFER(8, COMP_BUFFER_SIZE(2,
+	COMP_SAMPLE_SIZE(PIPELINE_FORMAT), 1,
+	COMP_PERIOD_FRAMES(PCM_MAX_RATE, SCHEDULE_PERIOD)),
+	PLATFORM_HOST_MEM_CAP)
+
+# B9: post-interleave_8 (8ch host)
+W_BUFFER(9, COMP_BUFFER_SIZE(2,
+	COMP_SAMPLE_SIZE(PIPELINE_FORMAT), PIPELINE_CHANNELS,
+	COMP_PERIOD_FRAMES(PCM_MAX_RATE, SCHEDULE_PERIOD)),
+	PLATFORM_HOST_MEM_CAP)
+
+#
+# Pipeline Graph
+#
+#  source DAI -> B0 -> deinterleave_8 -> B1..B8 -> interleave_8 -> B9 -> host PCM_C
+
+P_GRAPH(pipe-deinterleave-interleave-capture, PIPELINE_ID,
+	LIST(`		',
+	`dapm(N_DEINTERLEAVE_8(0), N_BUFFER(0))',
+	`dapm(N_BUFFER(1), N_DEINTERLEAVE_8(0))',
+	`dapm(N_BUFFER(2), N_DEINTERLEAVE_8(0))',
+	`dapm(N_BUFFER(3), N_DEINTERLEAVE_8(0))',
+	`dapm(N_BUFFER(4), N_DEINTERLEAVE_8(0))',
+	`dapm(N_BUFFER(5), N_DEINTERLEAVE_8(0))',
+	`dapm(N_BUFFER(6), N_DEINTERLEAVE_8(0))',
+	`dapm(N_BUFFER(7), N_DEINTERLEAVE_8(0))',
+	`dapm(N_BUFFER(8), N_DEINTERLEAVE_8(0))',
+	`dapm(N_INTERLEAVE_8(0), N_BUFFER(1))',
+	`dapm(N_INTERLEAVE_8(0), N_BUFFER(2))',
+	`dapm(N_INTERLEAVE_8(0), N_BUFFER(3))',
+	`dapm(N_INTERLEAVE_8(0), N_BUFFER(4))',
+	`dapm(N_INTERLEAVE_8(0), N_BUFFER(5))',
+	`dapm(N_INTERLEAVE_8(0), N_BUFFER(6))',
+	`dapm(N_INTERLEAVE_8(0), N_BUFFER(7))',
+	`dapm(N_INTERLEAVE_8(0), N_BUFFER(8))',
+	`dapm(N_BUFFER(9), N_INTERLEAVE_8(0))',
+	`dapm(N_PCMC(PCM_ID), N_BUFFER(9))'))
+
+#
+# Pipeline Source and Sinks
+#
+indir(`define', concat(`PIPELINE_SINK_', PIPELINE_ID), N_BUFFER(0))
+indir(`define', concat(`PIPELINE_PCM_', PIPELINE_ID), Round-trip Capture PCM_ID)
+
+#
+# PCM Configuration
+#
+PCM_CAPABILITIES(Round-trip Capture PCM_ID, CAPABILITY_FORMAT_NAME(PIPELINE_FORMAT),
+	PCM_MIN_RATE, PCM_MAX_RATE, 2, PIPELINE_CHANNELS, 2, 16, 192, 16384, 65536, 65536)
