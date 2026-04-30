@@ -25,6 +25,14 @@ W_BUFFER(0, COMP_BUFFER_SIZE(2,
 	PLATFORM_HOST_MEM_CAP)
 
 #
+# W_PIPELINE explicite OBLIGATOIRE pour piggyback scheduling.
+# SCHED_COMP est défini par le 13e arg de PIPELINE_PCM_ADD (= PIPELINE_SCHED_COMP_<master>)
+# Pattern hpmon : pipe-hp-monitor-capture.m4:41
+#
+W_PIPELINE(SCHED_COMP, SCHEDULE_PERIOD, SCHEDULE_PRIORITY, SCHEDULE_CORE,
+	SCHEDULE_TIME_DOMAIN, pipe_media_schedule_plat)
+
+#
 # Pipeline Graph (interne, le sink B0 vient de cross-pipeline)
 #  B0 -> host PCM_C
 P_GRAPH(pipe-host-mono-capture, PIPELINE_ID,
