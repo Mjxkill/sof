@@ -16,6 +16,7 @@
 #include <sof/lib/uuid.h>
 #include <ipc/dai.h>
 #include <errno.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 LOG_MODULE_REGISTER(sai, CONFIG_SOF_LOG_LEVEL);
@@ -95,6 +96,18 @@ static void sai_start(struct dai *dai, int direction)
 	if (!n)
 		n = 1;
 
+	/* IDEMPOTENCE TX: once sai_set_config has run, TX TERE/TRCE/MCLK are
+	 * permanently set (continuous BCLK/FSYNC). Skip prime FIFO + TRCE +
+	 * TERE writes — those would risk a BCLK transient. Only FRDE needs
+	 * to be set here to enable the DMA request; FRDE does not affect
+	 * the clock generators (only TE/BCE do).
+	 */
+	if (direction == DAI_DIR_PLAYBACK && sai->configured) {
+		dai_update_bits(dai, REG_SAI_XCSR(direction),
+				REG_SAI_CSR_FRDE, REG_SAI_CSR_FRDE);
+		return;
+	}
+
 	if (direction == DAI_DIR_PLAYBACK) {
 		for (i = 0; i < n; i++)
 			dai_write(dai, REG_SAI_TDR0, 0x0);
@@ -132,10 +145,21 @@ static void sai_release(struct dai *dai, int direction)
 {
 	dai_info(dai, "SAI: sai_release");
 
+	struct sai_pdata *sai = dai_get_drvdata(dai);
 	int chan_idx = 0;
 #ifdef CONFIG_IMX8ULP
 	int fifo_offset = 0;
 #endif
+
+	/* IDEMPOTENCE TX: skip TRCE+TERE writes once configured. Only FRDE
+	 * needs to be set to re-enable DMA request. Same rationale as sai_start.
+	 */
+	if (direction == DAI_DIR_PLAYBACK && sai->configured) {
+		dai_update_bits(dai, REG_SAI_XCSR(direction),
+				REG_SAI_CSR_FRDE, REG_SAI_CSR_FRDE);
+		return;
+	}
+
 	/* enable DMA requests */
 	dai_update_bits(dai, REG_SAI_XCSR(direction),
 			REG_SAI_CSR_FRDE, REG_SAI_CSR_FRDE);
@@ -164,7 +188,19 @@ static void sai_stop(struct dai *dai, int direction)
 {
 	dai_info(dai, "SAI: sai_stop");
 
+	struct sai_pdata *sai = dai_get_drvdata(dai);
 	int ret = 0;
+
+	/* IDEMPOTENCE TX: once configured, only clear FRDE on stop (= disable
+	 * DMA request, drains the FIFO). Skip TERE/TRCE/XIE which would
+	 * affect clock generators or are unnecessary. FRDE clear keeps
+	 * BCLK/FSYNC running so TAC PLL stays locked.
+	 */
+	if (direction == DAI_DIR_PLAYBACK && sai->configured) {
+		dai_update_bits(dai, REG_SAI_XCSR(direction),
+				REG_SAI_CSR_FRDE, 0);
+		return;
+	}
 
 	/* Disable DMA request */
 	dai_update_bits(dai, REG_SAI_XCSR(direction),
@@ -208,6 +244,19 @@ static inline int sai_set_config(struct dai *dai, struct ipc_config_dai *common_
 	uint32_t clk_div;
 	bool tdm_enable;
 	struct sai_pdata *sai = dai_get_drvdata(dai);
+
+	/* IDEMPOTENCE: configure SAI exactly once. Subsequent PCM opens (e.g.
+	 * playback after capture is already running, or both directions of the
+	 * same duplex device) MUST NOT touch any SAI register, otherwise the
+	 * read-modify-write transients on TX TRCE/TERE/MCLK_EN cause a brief
+	 * BCLK glitch and desync the TAC codec PLL — perceived as metallic
+	 * artifacts on playback. The TAC params are identical for cap and play
+	 * on the same SAI7 DAI so re-config would be redundant anyway.
+	 */
+	if (sai->configured) {
+		dai_info(dai, "SAI: sai_set_config skipped (already configured)");
+		return 0;
+	}
 
 	sai->config = *config;
 	sai->params = config->sai;
@@ -417,9 +466,17 @@ static inline int sai_set_config(struct dai *dai, struct ipc_config_dai *common_
 	 * For i.MX8MP, MCLK is bound with TX enable bit.
 	 * Therefore, enable transmitter to output MCLK
 	 */
-	/* Enable TX TRCE + TERE at boot for continuous clock output.
-	 * In async mode, RX receives clock from TX pins via PCB loopback.
-	 * Clock must be running before any capture starts.
+	/* Enable TX TRCE + TERE at config time for continuous clock output.
+	 * In async mode RX receives BCLK/FSYNC from TX pins via PCB loopback,
+	 * so the clock must run 24/7 once configured. TE/BCE drive clock
+	 * generation; touching them later is what would desync the TAC PLL.
+	 *
+	 * FRDE (DMA request enable) is NOT set here — it is toggled by
+	 * sai_start/sai_stop dynamically. FRDE only controls whether the
+	 * SAI peripheral requests transfers from the SDMA; it does not
+	 * affect BCLK/FSYNC clock generators, so toggling it is safe.
+	 * Setting FRDE=1 permanently here would leave the FIFO in
+	 * underflow between sessions and corrupt the next start.
 	 */
 	dai_update_bits(dai, REG_SAI_XCR3(REG_TX_DIR),
 			REG_SAI_CR3_TRCE_MASK, REG_SAI_CR3_TRCE(1));
@@ -430,6 +487,7 @@ static inline int sai_set_config(struct dai *dai, struct ipc_config_dai *common_
 			REG_SAI_MCTL_MCLK_EN);
 #endif
 
+	sai->configured = true;
 	return 0;
 }
 
