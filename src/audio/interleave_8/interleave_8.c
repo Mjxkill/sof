@@ -17,6 +17,7 @@
 #include <sof/audio/sink_api.h>
 #include <sof/audio/source_api.h>
 #include <sof/lib/uuid.h>
+#include <sof/list.h>
 #include <sof/trace/trace.h>
 #include <ipc/topology.h>
 #include <rtos/init.h>
@@ -49,10 +50,23 @@ static int interleave_8_prepare(struct processing_module *mod,
 				struct sof_source **sources, int num_of_sources,
 				struct sof_sink **sinks, int num_of_sinks)
 {
-	comp_dbg(mod->dev, "interleave_8_prepare: sources=%d sinks=%d",
+	struct comp_dev *dev = mod->dev;
+	struct list_item *blist;
+	struct comp_buffer *buf;
+
+	comp_dbg(dev, "interleave_8_prepare: sources=%d sinks=%d",
 		 num_of_sources, num_of_sinks);
 	mod->max_sources = INTERLEAVE_8_MAX_SOURCES;
 	mod->max_sinks = 1;
+
+	list_for_item(blist, &dev->bsource_list) {
+		buf = container_of(blist, struct comp_buffer, sink_list);
+		audio_stream_set_channels(&buf->stream, 1);
+	}
+	list_for_item(blist, &dev->bsink_list) {
+		buf = container_of(blist, struct comp_buffer, source_list);
+		audio_stream_set_channels(&buf->stream, INTERLEAVE_8_OUT_CHANNELS);
+	}
 	return 0;
 }
 

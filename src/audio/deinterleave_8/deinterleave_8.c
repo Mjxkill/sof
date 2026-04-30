@@ -18,6 +18,7 @@
 #include <sof/audio/sink_api.h>
 #include <sof/audio/source_api.h>
 #include <sof/lib/uuid.h>
+#include <sof/list.h>
 #include <sof/trace/trace.h>
 #include <ipc/topology.h>
 #include <rtos/init.h>
@@ -50,10 +51,23 @@ static int deinterleave_8_prepare(struct processing_module *mod,
 				  struct sof_source **sources, int num_of_sources,
 				  struct sof_sink **sinks, int num_of_sinks)
 {
-	comp_dbg(mod->dev, "deinterleave_8_prepare: sources=%d sinks=%d",
+	struct comp_dev *dev = mod->dev;
+	struct list_item *blist;
+	struct comp_buffer *buf;
+
+	comp_dbg(dev, "deinterleave_8_prepare: sources=%d sinks=%d",
 		 num_of_sources, num_of_sinks);
 	mod->max_sources = 1;
 	mod->max_sinks = DEINTERLEAVE_8_MAX_SINKS;
+
+	list_for_item(blist, &dev->bsource_list) {
+		buf = container_of(blist, struct comp_buffer, sink_list);
+		audio_stream_set_channels(&buf->stream, DEINTERLEAVE_8_IN_CHANNELS);
+	}
+	list_for_item(blist, &dev->bsink_list) {
+		buf = container_of(blist, struct comp_buffer, source_list);
+		audio_stream_set_channels(&buf->stream, 1);
+	}
 	return 0;
 }
 
@@ -134,6 +148,26 @@ static int deinterleave_8_process(struct processing_module *mod,
 	return 0;
 }
 
+static int deinterleave_8_trigger(struct processing_module *mod, int cmd)
+{
+	struct list_item *li;
+	struct comp_buffer *b;
+
+	/* Cross-pipeline sinks: foreign pipelines may not start synchronously
+	 * with ours (host-driven). Set overrun_permitted on cross-pipeline
+	 * sinks to avoid back-pressure stalls — those sinks are responsible
+	 * for flushing themselves. Pattern copied from mux.c:demux_trigger.
+	 */
+	if (cmd == COMP_TRIGGER_PRE_START) {
+		list_for_item(li, &mod->dev->bsink_list) {
+			b = container_of(li, struct comp_buffer, source_list);
+			if (b->sink->pipeline != mod->dev->pipeline)
+				audio_stream_set_overrun(&b->stream, true);
+		}
+	}
+	return module_adapter_set_state(mod, mod->dev, cmd);
+}
+
 static int deinterleave_8_reset(struct processing_module *mod)
 {
 	comp_dbg(mod->dev, "deinterleave_8_reset()");
@@ -150,6 +184,7 @@ static const struct module_interface deinterleave_8_interface = {
 	.init = deinterleave_8_init,
 	.prepare = deinterleave_8_prepare,
 	.process = deinterleave_8_process,
+	.trigger = deinterleave_8_trigger,
 	.reset = deinterleave_8_reset,
 	.free = deinterleave_8_free,
 };
