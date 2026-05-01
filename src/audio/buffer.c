@@ -75,6 +75,19 @@ struct comp_buffer *buffer_alloc(uint32_t size, uint32_t caps, uint32_t flags, u
 	audio_stream_set_underrun(&buffer->stream, !!(flags & SOF_BUF_UNDERRUN_PERMITTED));
 	audio_stream_set_overrun(&buffer->stream, !!(flags & SOF_BUF_OVERRUN_PERMITTED));
 
+	/* E5.e.1: lock channels at topology load so pipeline_comp_params_neg
+	 * (FORCE) cannot overwrite the per-buffer channel count for branched
+	 * mono buffers (deinterleave_8 sinks + intra-strip ch1 buffers).
+	 */
+	if (flags & SOF_BUF_PRESERVE_CHANNELS) {
+		uint16_t ch = (flags & SOF_BUF_CHANNELS_MASK) >> SOF_BUF_CHANNELS_SHIFT;
+
+		if (ch == 0)
+			ch = 1;
+		audio_stream_set_channels(&buffer->stream, ch);
+		buffer->preserve_channels = true;
+	}
+
 	list_init(&buffer->source_list);
 	list_init(&buffer->sink_list);
 
@@ -203,6 +216,7 @@ int buffer_set_params(struct comp_buffer *buffer,
 {
 	int ret;
 	int i;
+	uint16_t saved_channels;
 
 	CORE_CHECK_STRUCT(buffer);
 
@@ -214,11 +228,20 @@ int buffer_set_params(struct comp_buffer *buffer,
 	if (buffer->hw_params_configured && !force_update)
 		return 0;
 
+	/* E5.e.1 V5.4.1: opt-in lock — save channels for branched mono buffers
+	 * (deinterleave_8 sinks, interleave_8 sources) so pipeline_comp_params_neg's
+	 * BUFFER_UPDATE_FORCE doesn't overwrite the per-buffer channel count.
+	 */
+	saved_channels = audio_stream_get_channels(&buffer->stream);
+
 	ret = audio_stream_set_params(&buffer->stream, params);
 	if (ret < 0) {
 		buf_err(buffer, "buffer_set_params(): audio_stream_set_params failed");
 		return -EINVAL;
 	}
+
+	if (buffer->preserve_channels && saved_channels)
+		audio_stream_set_channels(&buffer->stream, saved_channels);
 
 	audio_stream_set_buffer_fmt(&buffer->stream, params->buffer_fmt);
 	for (i = 0; i < SOF_IPC_MAX_CHANNELS; i++)

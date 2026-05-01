@@ -99,6 +99,17 @@ struct sof_ipc_comp {
  */
 #define SOF_BUF_UNDERRUN_PERMITTED	BIT(1)
 
+/*
+ * V5.4.1 E5.e.1: lock buffer channels metadata so pipeline_comp_params_neg's
+ * BUFFER_UPDATE_FORCE doesn't overwrite the per-buffer channel count.
+ * Used for branched mono buffers in 8-strips capture pipelines.
+ * When set, upper byte of flags holds the locked channel count (default 1).
+ */
+#define SOF_BUF_PRESERVE_CHANNELS	BIT(2)
+#define SOF_BUF_CHANNELS_SHIFT		8
+#define SOF_BUF_CHANNELS_MASK		(0xFF << SOF_BUF_CHANNELS_SHIFT)
+#define SOF_BUF_FLAG_CHANNELS(n)	((uint32_t)((n) & 0xFF) << SOF_BUF_CHANNELS_SHIFT)
+
 /* the UUID size in bytes, shared between FW and host */
 #define SOF_UUID_SIZE	16
 

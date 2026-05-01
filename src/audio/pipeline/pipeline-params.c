@@ -119,7 +119,12 @@ static void pipeline_update_buffer_pcm_params(struct comp_buffer *buffer,
 	params->buffer_fmt = audio_stream_get_buffer_fmt(&buffer->stream);
 	params->frame_fmt = audio_stream_get_frm_fmt(&buffer->stream);
 	params->rate = audio_stream_get_rate(&buffer->stream);
-	params->channels = audio_stream_get_channels(&buffer->stream);
+	/* E5.e.1: don't propagate locked mono channels of branched buffers to
+	 * the walk-shared params — that would contaminate 8ch endpoints (SAI,
+	 * host PCM) downstream.
+	 */
+	if (!buffer->preserve_channels)
+		params->channels = audio_stream_get_channels(&buffer->stream);
 	for (i = 0; i < SOF_IPC_MAX_CHANNELS; i++)
 		params->chmap[i] = buffer->chmap[i];
 }

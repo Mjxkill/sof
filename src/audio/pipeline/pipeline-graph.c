@@ -246,6 +246,90 @@ int pipeline_free(struct pipeline *p)
 	return 0;
 }
 
+/* E5.e.1 V5.4.1: lock channels metadata for branched mono buffers in
+ * intra-pipeline split/merge topologies (deinterleave_8 / interleave_8 N->1).
+ * Prevents pipeline_comp_params_neg's BUFFER_UPDATE_FORCE from overwriting
+ * channels=PIPELINE_CHANNELS on the mono buffers between the splitter and the
+ * merger, which would cause volume_prepare/eq_iir_prepare/drc_prepare to
+ * fail with -ENOMEM (sink_period_bytes computed for 8ch but buffer alloc 1ch).
+ */
+static void pipeline_lock_chain_downstream(struct comp_buffer *buf, uint16_t channels)
+{
+	struct comp_buffer *next;
+
+	if (!buf || buf->preserve_channels)
+		return;
+
+	audio_stream_set_channels(&buf->stream, channels);
+	buf->preserve_channels = true;
+
+	if (!buf->sink || list_is_empty(&buf->sink->bsink_list))
+		return;
+
+	/* Stop at non-linear comp (multi-source or multi-sink) */
+	if (buf->sink->bsource_list.next != buf->sink->bsource_list.prev)
+		return;
+	if (buf->sink->bsink_list.next != buf->sink->bsink_list.prev)
+		return;
+
+	next = list_first_item(&buf->sink->bsink_list,
+			       struct comp_buffer, source_list);
+	pipeline_lock_chain_downstream(next, channels);
+}
+
+static void pipeline_lock_chain_upstream(struct comp_buffer *buf, uint16_t channels)
+{
+	struct comp_buffer *prev;
+
+	if (!buf || buf->preserve_channels)
+		return;
+
+	audio_stream_set_channels(&buf->stream, channels);
+	buf->preserve_channels = true;
+
+	if (!buf->source || list_is_empty(&buf->source->bsource_list))
+		return;
+
+	if (buf->source->bsource_list.next != buf->source->bsource_list.prev)
+		return;
+	if (buf->source->bsink_list.next != buf->source->bsink_list.prev)
+		return;
+
+	prev = list_first_item(&buf->source->bsource_list,
+			       struct comp_buffer, sink_list);
+	pipeline_lock_chain_upstream(prev, channels);
+}
+
+static int pipeline_lock_branched(struct comp_dev *current,
+				  struct comp_buffer *calling_buf,
+				  struct pipeline_walk_context *ctx, int dir)
+{
+	struct list_item *clist;
+	bool is_multi_sink, is_multi_source;
+
+	is_multi_sink = !list_is_empty(&current->bsink_list) &&
+			current->bsink_list.next != current->bsink_list.prev;
+	is_multi_source = !list_is_empty(&current->bsource_list) &&
+			  current->bsource_list.next != current->bsource_list.prev;
+
+	if (is_multi_sink) {
+		list_for_item(clist, &current->bsink_list) {
+			struct comp_buffer *buf =
+				container_of(clist, struct comp_buffer, source_list);
+			pipeline_lock_chain_downstream(buf, 1);
+		}
+	}
+	if (is_multi_source) {
+		list_for_item(clist, &current->bsource_list) {
+			struct comp_buffer *buf =
+				container_of(clist, struct comp_buffer, sink_list);
+			pipeline_lock_chain_upstream(buf, 1);
+		}
+	}
+
+	return pipeline_for_each_comp(current, ctx, dir);
+}
+
 static int pipeline_comp_complete(struct comp_dev *current,
 				  struct comp_buffer *calling_buf,
 				  struct pipeline_walk_context *ctx, int dir)
@@ -306,6 +390,19 @@ int pipeline_complete(struct pipeline *p, struct comp_dev *source,
 	 * complete component task and pipeline initialization
 	 */
 	ret = walk_ctx.comp_func(source, NULL, &walk_ctx, PPL_DIR_DOWNSTREAM);
+
+	/* E5.e.1: 2nd walk to detect intra-pipeline split/merge boundaries
+	 * (deinterleave_8 / interleave_8) and lock channels metadata of mono
+	 * buffers in linear sub-chains. Must run BEFORE first pipeline_params.
+	 */
+	if (ret == 0) {
+		struct pipeline_walk_context lock_ctx = {
+			.comp_func = pipeline_lock_branched,
+			.comp_data = &data,
+			.skip_incomplete = true,
+		};
+		(void)lock_ctx.comp_func(source, NULL, &lock_ctx, PPL_DIR_DOWNSTREAM);
+	}
 
 	p->source_comp = source;
 	p->sink_comp = sink;

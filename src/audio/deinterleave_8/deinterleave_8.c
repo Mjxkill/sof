@@ -67,6 +67,7 @@ static int deinterleave_8_prepare(struct processing_module *mod,
 	list_for_item(blist, &dev->bsink_list) {
 		buf = container_of(blist, struct comp_buffer, source_list);
 		audio_stream_set_channels(&buf->stream, 1);
+		buf->preserve_channels = true;
 	}
 	return 0;
 }

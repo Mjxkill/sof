@@ -158,6 +158,7 @@ struct comp_buffer {
 
 	bool hw_params_configured; /**< indicates whether hw params were set */
 	bool walking;		/**< indicates if the buffer is being walked */
+	bool preserve_channels;	/**< opt-in: buffer_set_params won't overwrite channels metadata */
 };
 
 /* Only to be used for synchronous same-core notifications! */
@@ -298,6 +299,7 @@ static inline void buffer_init(struct comp_buffer *buffer,
 static inline void buffer_reset_params(struct comp_buffer *buffer, void *data)
 {
 	buffer->hw_params_configured = false;
+	buffer->preserve_channels = false;
 }
 
 #endif /* __SOF_AUDIO_BUFFER_H__ */

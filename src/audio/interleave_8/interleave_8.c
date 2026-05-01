@@ -62,6 +62,7 @@ static int interleave_8_prepare(struct processing_module *mod,
 	list_for_item(blist, &dev->bsource_list) {
 		buf = container_of(blist, struct comp_buffer, sink_list);
 		audio_stream_set_channels(&buf->stream, 1);
+		buf->preserve_channels = true;
 	}
 	list_for_item(blist, &dev->bsink_list) {
 		buf = container_of(blist, struct comp_buffer, source_list);
