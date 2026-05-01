@@ -125,6 +125,11 @@ struct pipeline_data {
 #if CONFIG_KCPS_DYNAMIC_CLOCK_CONTROL
 	uint32_t kcps[CONFIG_CORE_COUNT]; /**< the max count of KCPS */
 #endif
+	/* V5.4.1 E6.a: per-tick sequence number for pipeline_comp_copy
+	 * re-entry guard. Set by pipeline_copy() before walking the graph;
+	 * each comp records this on first visit per tick (via comp_dev.copy_seq).
+	 */
+	uint32_t copy_seq;
 };
 
 /** \brief Task type registered by pipelines. */

@@ -109,6 +109,17 @@ static int pipeline_comp_copy(struct comp_dev *current,
 		return 0;
 	}
 
+	/* V5.4.1 E6.a: re-entry guard for intra-pipeline split/merge topologies
+	 * (e.g. deinterleave_8 + mixer16 + interleave_8). pipeline_for_each_comp
+	 * uses a per-buffer 'walking' flag that is cleared after recursion, so
+	 * the same comp can be revisited via alternative branched buffers. The
+	 * counter is set by pipeline_copy() before the walk; on first visit per
+	 * tick we record it on the comp, subsequent visits short-circuit here.
+	 */
+	if (current->copy_seq == ppl_data->copy_seq)
+		return 0;
+	current->copy_seq = ppl_data->copy_seq;
+
 	/* copy to downstream immediately */
 	if (dir == PPL_DIR_DOWNSTREAM) {
 		err = comp_copy(current);
@@ -133,7 +144,13 @@ static int pipeline_comp_copy(struct comp_dev *current,
  */
 int pipeline_copy(struct pipeline *p)
 {
-	struct pipeline_data data;
+	/* V5.4.1 E6.a: monotonic per-tick sequence number for the comp_copy
+	 * re-entry guard. uint32 wraps every ~50 days at 1 kHz LL ticks; the
+	 * value 0 is the rzalloc'd default of comp_dev.copy_seq, so we skip it
+	 * to avoid a false positive on the very first tick after pipeline_new.
+	 */
+	static uint32_t pipeline_copy_global_seq;
+	struct pipeline_data data = { 0 };
 	struct pipeline_walk_context walk_ctx = {
 		.comp_func = pipeline_comp_copy,
 		.comp_data = &data,
@@ -153,6 +170,9 @@ int pipeline_copy(struct pipeline *p)
 
 	data.start = start;
 	data.p = p;
+	data.copy_seq = ++pipeline_copy_global_seq;
+	if (!data.copy_seq)
+		data.copy_seq = ++pipeline_copy_global_seq;
 
 	ret = walk_ctx.comp_func(start, NULL, &walk_ctx, dir);
 	if (ret < 0)

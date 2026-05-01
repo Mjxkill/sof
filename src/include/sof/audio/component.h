@@ -588,6 +588,15 @@ struct comp_dev {
 	uint32_t direction;	/**< enum sof_ipc_stream_direction */
 	bool direction_set; /**< flag indicating that the direction has been set */
 
+	/* V5.4.1 E6.a: per-tick re-entry guard for pipeline_comp_copy.
+	 * Protects against combinatorial walks in intra-pipeline split/merge
+	 * topologies (deinterleave_8 + mixer16 + interleave_8) where multiple
+	 * branched buffer paths would otherwise revisit the same comp.
+	 * Initialised to 0 by rzalloc; updated to ppl_data->copy_seq on first
+	 * visit per tick by pipeline_comp_copy.
+	 */
+	uint32_t copy_seq;
+
 	const struct comp_driver *drv;	/**< driver */
 
 	/* lists */
