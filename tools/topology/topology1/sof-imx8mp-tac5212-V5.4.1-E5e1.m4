@@ -1,13 +1,16 @@
 #
-# V5.4.1 Phase 1a.3 E5.d — passthrough 8ch via deinterleave_8 + interleave_8 (sans cross-pipeline)
+# V5.4.1 Phase 1a.3 E5.e.1 — 1 strip IN ch1 (eq_iir + drc + pga_L + pga_R) neutre
 #
-# Architecture conforme cahier des charges :
-#   - 1 PCM ALSA capture 8ch (ASIO IN)
-#   - 1 PCM ALSA playback 8ch (ASIO OUT, identique V3.2.2 baseline)
-#   - 8 mono buffers RESTENT INTERNES au DSP (jamais exposés à Linux)
+# Architecture E5.d + 1 strip IN sur ch1 :
+#   PIPE 1 cap : SAI7 RX 8ch -> deinterleave_8 -> [strip ch1 : eq_iir -> drc -> pga_L -> pga_R]
+#                                              -> [bypass ch2..8]
+#                                              -> interleave_8 -> host PCM 0 (ASIO IN 8ch)
+#   PIPE 2 play : host PCM 1 -> volume -> SAI7 TX 8ch (ASIO OUT 8ch identique V3.2.2)
 #
-# Test attendu : arecord -Dhw:2,0 -c 8 -f S32_LE bit-perfect identique au V3.2.2 baseline.
-# Si OK → valide deinterleave_8 + interleave_8 + max_sinks=8 + override channels in prepare.
+# Test attendu :
+#   - Avec eq_iir blob = pass + drc default + vol_L=vol_R=0dB → ch1 doit être bit-perfect = passthrough
+#   - amixer doit lister "Strip1 EQ IIR Coefs", "Strip1 DRC Config", "Strip1 Volume L", "Strip1 Volume R"
+#   - NPU tap doit voir signal mic correctement traité par strip ch1
 #
 
 include(`utils.m4')
@@ -22,9 +25,9 @@ include(`sof/tokens.m4')
 include(`platform/imx/imx8.m4')
 
 #
-# PIPE 1 : capture 8ch — SAI RX → deinterleave_8 → 8 mono internes → interleave_8 → host PCM 0 (8ch)
+# PIPE 1 : capture 8ch — strip ch1 + bypass ch2..8
 #
-PIPELINE_PCM_ADD(sof/pipe-deint-interleave-capture.m4,
+PIPELINE_PCM_ADD(sof/pipe-deint-strip1-interleave-capture.m4,
 	1, 0, 8, s32le,
 	2000, 0, 0,
 	48000, 48000, 48000,
@@ -56,9 +59,7 @@ DAI_ADD(sof/pipe-dai-playback.m4,
 	2000, 0, 0, SCHEDULE_TIME_DOMAIN_DMA)
 
 #
-# PCM ALSA export : 1 device duplex 8ch (V3.2.2 baseline pattern)
-# PCM_DUPLEX_ADD nécessaire car SAI7 codec_consumer : le TX ne tourne
-# pas si RX n'est pas démarré simultanément.
+# PCM ALSA export : 1 device duplex 8ch
 #
 PCM_DUPLEX_ADD(TAC5212, 0, PIPELINE_PCM_2, PIPELINE_PCM_1)
 
