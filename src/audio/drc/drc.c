@@ -48,24 +48,25 @@ void drc_reset_state(struct drc_state *state)
 {
 	int i;
 
+	/* Single contiguous allocation owned by index 0. */
 	rfree(state->pre_delay_buffers[0]);
 	for (i = 0; i < PLATFORM_MAX_CHANNELS; ++i) {
 		state->pre_delay_buffers[i] = NULL;
+
+		state->detector_average[i] = 0;
+		state->compressor_gain[i] = Q_CONVERT_FLOAT(1.0f, 30);
+
+		state->envelope_rate[i] = 0;
+		state->scaled_desired_gain[i] = 0;
+
+		state->max_attack_compression_diff_db[i] = INT32_MIN;
 	}
 
-	state->detector_average = 0;
-	state->compressor_gain = Q_CONVERT_FLOAT(1.0f, 30);
+	state->processed = 0;
 
 	state->last_pre_delay_frames = DRC_DEFAULT_PRE_DELAY_FRAMES;
 	state->pre_delay_read_index = 0;
 	state->pre_delay_write_index = DRC_DEFAULT_PRE_DELAY_FRAMES;
-
-	state->envelope_rate = 0;
-	state->scaled_desired_gain = 0;
-
-	state->processed = 0;
-
-	state->max_attack_compression_diff_db = INT32_MIN;
 }
 
 int drc_init_pre_delay_buffers(struct drc_state *state,
@@ -97,7 +98,10 @@ int drc_set_pre_delay_time(struct drc_state *state,
 {
 	int32_t pre_delay_frames;
 
-	/* Re-configure look-ahead section pre-delay if delay time has changed. */
+	/* Re-configure look-ahead section pre-delay if delay time has changed.
+	 * Pre-delay is shared across channels (one ring per channel but indices
+	 * are synchronous) to keep multi-channel audio aligned.
+	 */
 	pre_delay_frames = Q_MULTSR_32X32((int64_t)pre_delay_time, rate, 30, 0, 0);
 	if (pre_delay_frames < 0)
 		return -EINVAL;
@@ -121,21 +125,66 @@ int drc_set_pre_delay_time(struct drc_state *state,
 	return 0;
 }
 
+/* Detect how many sof_drc_params sets are packed in the configuration blob.
+ * Returns 1 for the legacy single-config layout, N for a multi-config blob.
+ * Result is clamped to [1, PLATFORM_MAX_CHANNELS].
+ */
+static uint32_t drc_count_params_in_config(const struct sof_drc_config *config)
+{
+	uint32_t extra_bytes;
+	uint32_t n;
+
+	if (!config || config->size <= sizeof(struct sof_drc_config))
+		return 1;
+
+	extra_bytes = config->size - sizeof(struct sof_drc_config);
+	n = 1 + extra_bytes / sizeof(struct sof_drc_params);
+
+	if (n > PLATFORM_MAX_CHANNELS)
+		n = PLATFORM_MAX_CHANNELS;
+	return n;
+}
+
+/* Resolve params for a given channel index. Channels beyond channels_in_config
+ * replicate the last available params (graceful degradation when blob has
+ * fewer configs than the actual stream channels).
+ */
+const struct sof_drc_params *drc_get_params(const struct drc_comp_data *cd, int ch)
+{
+	uint32_t n = cd->channels_in_config;
+	const struct sof_drc_params *base = &cd->config->params;
+
+	if (n <= 1)
+		return base;
+	if ((uint32_t)ch >= n)
+		ch = n - 1;
+	return &base[ch];
+}
+
 static int drc_setup(struct drc_comp_data *cd, uint16_t channels, uint32_t rate)
 {
 	uint32_t sample_bytes = get_sample_bytes(cd->source_format);
 	int ret;
+	int ch;
 
-	/* Reset any previous state */
+	/* Reset any previous state (clears all per-channel arrays). */
 	drc_reset_state(&cd->state);
 
-	/* Allocate pre-delay buffers */
+	/* Detect single-config (back-compat) vs multi-config layout. */
+	cd->channels_in_config = drc_count_params_in_config(cd->config);
+
+	/* Allocate pre-delay buffers (one contiguous block, sliced per channel). */
 	ret = drc_init_pre_delay_buffers(&cd->state, (size_t)sample_bytes, (int)channels);
 	if (ret < 0)
 		return ret;
 
-	/* Set pre-dely time */
-	return drc_set_pre_delay_time(&cd->state, cd->config->params.pre_delay_time, rate);
+	/* Set pre-delay time once — uses params[0]'s pre_delay_time. The ring
+	 * indices are shared across channels to keep audio aligned. Per-channel
+	 * pre_delay_time would desync inter-channel timing.
+	 */
+	(void)ch;
+	ret = drc_set_pre_delay_time(&cd->state, cd->config->params.pre_delay_time, rate);
+	return ret;
 }
 
 /*
@@ -286,8 +335,27 @@ static int drc_process(struct processing_module *mod,
 		}
 	}
 
-	/* Control pass-though in processing function with switch control */
-	cd->enabled = cd->config && cd->config->params.enabled && cd->enable_switch;
+	/* Control pass-through in processing function with switch control.
+	 * Multi-config: DRC is enabled if ANY channel has enabled=1 (the
+	 * per-channel enable flag is also read at the gain-application level
+	 * inside the algorithm, so a per-channel enabled=0 still produces
+	 * pass-through samples for that channel).
+	 */
+	if (cd->config) {
+		uint32_t i;
+		bool any_enabled = false;
+		const struct sof_drc_params *base = &cd->config->params;
+
+		for (i = 0; i < cd->channels_in_config; i++) {
+			if (base[i].enabled) {
+				any_enabled = true;
+				break;
+			}
+		}
+		cd->enabled = any_enabled && cd->enable_switch;
+	} else {
+		cd->enabled = false;
+	}
 
 	cd->drc_func(mod, source, sink, frames);
 

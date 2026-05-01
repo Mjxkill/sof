@@ -69,8 +69,10 @@ static void multiband_drc_s16_process_drc(struct drc_state *state,
 	int pd_read_index;
 
 	if (p->enabled && !state->processed) {
-		drc_update_envelope(state, p);
-		drc_compress_output(state, p, 2, nch);
+		for (ch = 0; ch < nch; ++ch) {
+			drc_update_envelope(state, p, ch);
+			drc_compress_output(state, p, 2, ch);
+		}
 		state->processed = 1;
 	}
 
@@ -96,11 +98,13 @@ static void multiband_drc_s16_process_drc(struct drc_state *state,
 	if (!p->enabled)
 		return;
 
-	/* Process the input division (32 frames). */
+	/* Process the input division (32 frames) per channel. */
 	if (!(pd_write_index & DRC_DIVISION_FRAMES_MASK)) {
-		drc_update_detector_average(state, p, 2, nch);
-		drc_update_envelope(state, p);
-		drc_compress_output(state, p, 2, nch);
+		for (ch = 0; ch < nch; ++ch) {
+			drc_update_detector_average(state, p, 2, ch);
+			drc_update_envelope(state, p, ch);
+			drc_compress_output(state, p, 2, ch);
+		}
 	}
 }
 #endif /* CONFIG_FORMAT_S16LE */
@@ -119,8 +123,10 @@ static void multiband_drc_s32_process_drc(struct drc_state *state,
 	int pd_read_index;
 
 	if (p->enabled && !state->processed) {
-		drc_update_envelope(state, p);
-		drc_compress_output(state, p, 4, nch);
+		for (ch = 0; ch < nch; ++ch) {
+			drc_update_envelope(state, p, ch);
+			drc_compress_output(state, p, 4, ch);
+		}
 		state->processed = 1;
 	}
 
@@ -146,11 +152,13 @@ static void multiband_drc_s32_process_drc(struct drc_state *state,
 	if (!p->enabled)
 		return;
 
-	/* Process the input division (32 frames). */
+	/* Process the input division (32 frames) per channel. */
 	if (!(pd_write_index & DRC_DIVISION_FRAMES_MASK)) {
-		drc_update_detector_average(state, p, 4, nch);
-		drc_update_envelope(state, p);
-		drc_compress_output(state, p, 4, nch);
+		for (ch = 0; ch < nch; ++ch) {
+			drc_update_detector_average(state, p, 4, ch);
+			drc_update_envelope(state, p, ch);
+			drc_compress_output(state, p, 4, ch);
+		}
 	}
 }
 #endif /* CONFIG_FORMAT_S24LE || CONFIG_FORMAT_S32LE */

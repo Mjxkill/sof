@@ -24,15 +24,23 @@ int drc_set_pre_delay_time(struct drc_state *state,
 			   int32_t pre_delay_time,
 			   int32_t rate);
 
-/* drc process functions */
+/* Resolve params for a given channel index in a (possibly multi-config) blob. */
+const struct sof_drc_params *drc_get_params(const struct drc_comp_data *cd, int ch);
+
+/* drc process functions — V5.4.1 D3: per-channel processing.
+ * Each call processes a single channel using state->fields[ch] and
+ * pre_delay_buffers[ch]. nbyte is sample size in bytes (2 or 4).
+ */
 void drc_update_detector_average(struct drc_state *state,
 				 const struct sof_drc_params *p,
 				 int nbyte,
-				 int nch);
-void drc_update_envelope(struct drc_state *state, const struct sof_drc_params *p);
+				 int ch);
+void drc_update_envelope(struct drc_state *state,
+			 const struct sof_drc_params *p,
+			 int ch);
 void drc_compress_output(struct drc_state *state,
 			 const struct sof_drc_params *p,
 			 int nbyte,
-			 int nch);
+			 int ch);
 
 #endif //  __SOF_AUDIO_DRC_DRC_ALGORITHM_H__

@@ -58,13 +58,28 @@ struct sof_drc_params {
 	int32_t kE; /* Q20.12 */
 } __attribute__((packed));
 
+/* DRC configuration blob.
+ *
+ * Back-compat layout: the legacy single-config blob has size ==
+ * sizeof(struct sof_drc_config), which equals the offset of params + sizeof
+ * (struct sof_drc_params). The DRC component reads this and applies the
+ * single params set to all channels.
+ *
+ * V5.4.1 E5.e.2 D3 multi-config: a blob with size > sizeof(struct
+ * sof_drc_config) carries N consecutive sof_drc_params after the reserved
+ * field, where:
+ *   N = (size - offsetof(struct sof_drc_config, params)) / sizeof(struct sof_drc_params)
+ * Channel ch uses params[ch] when ch < N, else params[N - 1] (replicate last).
+ * No struct field added — detection is purely from blob size, so existing
+ * single-config blobs continue to work unchanged.
+ */
 struct sof_drc_config {
 	uint32_t size;
 
 	/* reserved */
 	uint32_t reserved[4];
 
-	struct sof_drc_params params;
+	struct sof_drc_params params; /* (back-compat) or params[0] of multi-config */
 } __attribute__((packed));
 
 #endif //  __USER_DRC_H__

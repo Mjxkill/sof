@@ -77,15 +77,20 @@ static int32_t volume_gain(const struct sof_drc_params *p, int32_t x)
 	return y;
 }
 
-/* Update detector_average from the last input division. */
+/* Update detector_average from the last input division for ONE channel.
+ *
+ * V5.4.1 D3: per-channel — the detector tracks the abs envelope of just
+ * the requested channel (was MAX across all channels in the upstream
+ * implementation). state->detector_average[ch] is the per-channel state.
+ */
 void drc_update_detector_average(struct drc_state *state,
 				 const struct sof_drc_params *p,
 				 int nbyte,
-				 int nch)
+				 int ch)
 {
-	int32_t detector_average = state->detector_average; /* Q2.30 */
+	int32_t detector_average = state->detector_average[ch]; /* Q2.30 */
 	int32_t abs_input_array[DRC_DIVISION_FRAMES]; /* Q1.31 */
-	int div_start, i, ch;
+	int div_start, i;
 	int16_t *sample16_p; /* for s16 format case */
 	int32_t *sample32_p; /* for s24 and s32 format cases */
 	int32_t sample;
@@ -102,26 +107,18 @@ void drc_update_detector_average(struct drc_state *state,
 		div_start = state->pre_delay_write_index - DRC_DIVISION_FRAMES;
 	}
 
-	/* The max abs value across all channels for this frame */
+	/* Abs samples for this channel only. */
 	if (nbyte == 2) { /* 2 bytes per sample */
 		for (i = 0; i < DRC_DIVISION_FRAMES; i++) {
-			abs_input_array[i] = 0;
-			for (ch = 0; ch < nch; ch++) {
-				sample16_p =
-					(int16_t *)state->pre_delay_buffers[ch] + div_start + i;
-				sample = Q_SHIFT_LEFT((int32_t)*sample16_p, 15, 31);
-				abs_input_array[i] = MAX(abs_input_array[i], ABS(sample));
-			}
+			sample16_p = (int16_t *)state->pre_delay_buffers[ch] + div_start + i;
+			sample = Q_SHIFT_LEFT((int32_t)*sample16_p, 15, 31);
+			abs_input_array[i] = ABS(sample);
 		}
 	} else { /* 4 bytes per sample */
 		for (i = 0; i < DRC_DIVISION_FRAMES; i++) {
-			abs_input_array[i] = 0;
-			for (ch = 0; ch < nch; ch++) {
-				sample32_p =
-					(int32_t *)state->pre_delay_buffers[ch] + div_start + i;
-				sample = *sample32_p;
-				abs_input_array[i] = MAX(abs_input_array[i], ABS(sample));
-			}
+			sample32_p = (int32_t *)state->pre_delay_buffers[ch] + div_start + i;
+			sample = *sample32_p;
+			abs_input_array[i] = ABS(sample);
 		}
 	}
 
@@ -163,16 +160,18 @@ void drc_update_detector_average(struct drc_state *state,
 		detector_average = MIN(detector_average, ONE_Q30);
 	}
 
-	state->detector_average = detector_average;
+	state->detector_average[ch] = detector_average;
 }
 
-/* Updates the envelope_rate used for the next division */
-void drc_update_envelope(struct drc_state *state, const struct sof_drc_params *p)
+/* Updates the envelope_rate used for the next division (per-channel). */
+void drc_update_envelope(struct drc_state *state,
+			 const struct sof_drc_params *p,
+			 int ch)
 {
 	/* Calculate desired gain */
 
 	/* Pre-warp so we get desired_gain after sin() warp below. */
-	int32_t scaled_desired_gain = drc_asin_fixed(state->detector_average); /* Q2.30 */
+	int32_t scaled_desired_gain = drc_asin_fixed(state->detector_average[ch]); /* Q2.30 */
 
 	/* Deal with envelopes */
 
@@ -182,13 +181,13 @@ void drc_update_envelope(struct drc_state *state, const struct sof_drc_params *p
 	 */
 	int32_t envelope_rate;
 
-	int is_releasing = scaled_desired_gain > state->compressor_gain;
+	int is_releasing = scaled_desired_gain > state->compressor_gain[ch];
 
 	/* compression_diff_db is the difference between current compression
 	 * level and the desired level. */
-	int is_bad_db = (state->compressor_gain == 0 || scaled_desired_gain == 0);
+	int is_bad_db = (state->compressor_gain[ch] == 0 || scaled_desired_gain == 0);
 	int32_t compression_diff_db =
-		drc_lin2db_fixed(Q_SHIFT_RND(state->compressor_gain, 30, 26)) -
+		drc_lin2db_fixed(Q_SHIFT_RND(state->compressor_gain[ch], 30, 26)) -
 			drc_lin2db_fixed(Q_SHIFT_RND(scaled_desired_gain, 30, 26)); /* Q11.21 */
 
 	int32_t x, x2, x3, x4;
@@ -198,7 +197,7 @@ void drc_update_envelope(struct drc_state *state, const struct sof_drc_params *p
 
 	if (is_releasing) {
 		/* Release mode - compression_diff_db should be negative dB */
-		state->max_attack_compression_diff_db = INT32_MIN;
+		state->max_attack_compression_diff_db[ch] = INT32_MIN;
 
 		/* Fix gremlins. */
 		if (is_bad_db)
@@ -242,11 +241,11 @@ void drc_update_envelope(struct drc_state *state, const struct sof_drc_params *p
 		 * the largest compression_diff_db we've encountered so far.
 		 */
 		sat32 = sat_int32(Q_SHIFT_LEFT((int64_t)compression_diff_db, 21, 24));
-		state->max_attack_compression_diff_db =
-			MAX(state->max_attack_compression_diff_db, sat32);
+		state->max_attack_compression_diff_db[ch] =
+			MAX(state->max_attack_compression_diff_db[ch], sat32);
 
 		eff_atten_diff_db =
-			MAX(HALF_Q24, state->max_attack_compression_diff_db); /* Q8.24 */
+			MAX(HALF_Q24, state->max_attack_compression_diff_db[ch]); /* Q8.24 */
 
 		/* x = 0.25f / eff_atten_diff_db;
 		 * => x = 1.0f / (eff_atten_diff_db << 2);
@@ -255,16 +254,21 @@ void drc_update_envelope(struct drc_state *state, const struct sof_drc_params *p
 		envelope_rate = ONE_Q20 - drc_pow_fixed(x, p->one_over_attack_frames); /* Q12.20 */
 	}
 
-	state->envelope_rate = sat_int32(Q_SHIFT_LEFT((int64_t)envelope_rate, 20, 30));
-	state->scaled_desired_gain = scaled_desired_gain;
+	state->envelope_rate[ch] = sat_int32(Q_SHIFT_LEFT((int64_t)envelope_rate, 20, 30));
+	state->scaled_desired_gain[ch] = scaled_desired_gain;
 }
 
 /* Calculate compress_gain from the envelope and apply total_gain to compress
- * the next output division. */
+ * the next output division for ONE channel.
+ *
+ * V5.4.1 D3: per-channel — uses state->compressor_gain[ch], envelope_rate[ch],
+ * scaled_desired_gain[ch] and writes back to state->compressor_gain[ch].
+ * Samples are read/written from pre_delay_buffers[ch].
+ */
 void drc_compress_output(struct drc_state *state,
 			 const struct sof_drc_params *p,
 			 int nbyte,
-			 int nch)
+			 int ch)
 {
 	const int div_start = state->pre_delay_read_index;
 	int count = DRC_DIVISION_FRAMES >> 2;
@@ -274,18 +278,18 @@ void drc_compress_output(struct drc_state *state,
 	int32_t post_warp_compressor_gain;
 	int32_t total_gain;
 
-	int i, j, ch, inc;
+	int i, j, inc;
 	int16_t *sample16_p; /* for s16 format case */
 	int32_t *sample32_p; /* for s24 and s32 format cases */
 	int32_t sample;
 	int is_2byte = (nbyte == 2); /* otherwise is 4-bytes */
 
 	/* Exponential approach to desired gain. */
-	if (state->envelope_rate < ONE_Q30) {
+	if (state->envelope_rate[ch] < ONE_Q30) {
 		/* Attack - reduce gain to desired. */
-		c = state->compressor_gain - state->scaled_desired_gain;
-		base = state->scaled_desired_gain;
-		r = ONE_Q30 - state->envelope_rate;
+		c = state->compressor_gain[ch] - state->scaled_desired_gain[ch];
+		base = state->scaled_desired_gain[ch];
+		r = ONE_Q30 - state->envelope_rate[ch];
 		x[0] = Q_MULTSR_32X32((int64_t)c,  r, 30, 30, 30);
 		for (j = 1; j < 4; j++)
 			x[j] = Q_MULTSR_32X32((int64_t)x[j - 1], r, 30, 30, 30);
@@ -308,17 +312,15 @@ void drc_compress_output(struct drc_state *state,
 								    post_warp_compressor_gain,
 								    24, 31, 24); /* Q8.24 */
 
-					/* Apply final gain. */
-					for (ch = 0; ch < nch; ch++) {
-						sample16_p =
-							(int16_t *)state->pre_delay_buffers[ch] +
-								div_start + inc;
-						sample = (int32_t)*sample16_p;
-						*sample16_p =
-							sat_int16(Q_MULTSR_32X32((int64_t)sample,
-										 total_gain,
-										 15, 24, 15));
-					}
+					/* Apply final gain on this channel only. */
+					sample16_p =
+						(int16_t *)state->pre_delay_buffers[ch] +
+							div_start + inc;
+					sample = (int32_t)*sample16_p;
+					*sample16_p =
+						sat_int16(Q_MULTSR_32X32((int64_t)sample,
+									 total_gain,
+									 15, 24, 15));
 					inc++;
 				}
 
@@ -331,28 +333,21 @@ void drc_compress_output(struct drc_state *state,
 		} else { /* 4 bytes per sample */
 			while (1) {
 				for (j = 0; j < 4; j++) {
-					/* Warp pre-compression gain to smooth out sharp
-					 * exponential transition points.
-					 */
 					post_warp_compressor_gain =
 						drc_sin_fixed(x[j] + base); /* Q1.31 */
 
-					/* Calculate total gain using master gain. */
 					total_gain = Q_MULTSR_32X32((int64_t)p->master_linear_gain,
 								    post_warp_compressor_gain,
 								    24, 31, 24); /* Q8.24 */
 
-					/* Apply final gain. */
-					for (ch = 0; ch < nch; ch++) {
-						sample32_p =
-							(int32_t *)state->pre_delay_buffers[ch] +
-								div_start + inc;
-						sample = *sample32_p;
-						*sample32_p =
-							sat_int32(Q_MULTSR_32X32((int64_t)sample,
-										 total_gain,
-										 31, 24, 31));
-					}
+					sample32_p =
+						(int32_t *)state->pre_delay_buffers[ch] +
+							div_start + inc;
+					sample = *sample32_p;
+					*sample32_p =
+						sat_int32(Q_MULTSR_32X32((int64_t)sample,
+									 total_gain,
+									 31, 24, 31));
 					inc++;
 				}
 
@@ -364,11 +359,11 @@ void drc_compress_output(struct drc_state *state,
 			}
 		}
 
-		state->compressor_gain = x[3] + base;
+		state->compressor_gain[ch] = x[3] + base;
 	} else {
 		/* Release - exponentially increase gain to 1.0 */
-		c = state->compressor_gain;
-		r = state->envelope_rate;
+		c = state->compressor_gain[ch];
+		r = state->envelope_rate[ch];
 		x[0] = Q_MULTSR_32X32((int64_t)c,  r, 30, 30, 30);
 		for (j = 1; j < 4; j++)
 			x[j] = Q_MULTSR_32X32((int64_t)x[j - 1], r, 30, 30, 30);
@@ -380,27 +375,20 @@ void drc_compress_output(struct drc_state *state,
 		if (is_2byte) { /* 2 bytes per sample */
 			while (1) {
 				for (j = 0; j < 4; j++) {
-					/* Warp pre-compression gain to smooth out sharp
-					 * exponential transition points.
-					 */
 					post_warp_compressor_gain = drc_sin_fixed(x[j]); /* Q1.31 */
 
-					/* Calculate total gain using master gain. */
 					total_gain = Q_MULTSR_32X32((int64_t)p->master_linear_gain,
 								    post_warp_compressor_gain,
 								    24, 31, 24); /* Q8.24 */
 
-					/* Apply final gain. */
-					for (ch = 0; ch < nch; ch++) {
-						sample16_p =
-							(int16_t *)state->pre_delay_buffers[ch] +
-								div_start + inc;
-						sample = (int32_t)*sample16_p;
-						*sample16_p =
-							sat_int16(Q_MULTSR_32X32((int64_t)sample,
-										 total_gain,
-										 15, 24, 15));
-					}
+					sample16_p =
+						(int16_t *)state->pre_delay_buffers[ch] +
+							div_start + inc;
+					sample = (int32_t)*sample16_p;
+					*sample16_p =
+						sat_int16(Q_MULTSR_32X32((int64_t)sample,
+									 total_gain,
+									 15, 24, 15));
 					inc++;
 				}
 
@@ -414,27 +402,20 @@ void drc_compress_output(struct drc_state *state,
 		} else { /* 4 bytes per sample */
 			while (1) {
 				for (j = 0; j < 4; j++) {
-					/* Warp pre-compression gain to smooth out sharp
-					 * exponential transition points.
-					 */
 					post_warp_compressor_gain = drc_sin_fixed(x[j]); /* Q1.31 */
 
-					/* Calculate total gain using master gain. */
 					total_gain = Q_MULTSR_32X32((int64_t)p->master_linear_gain,
 								    post_warp_compressor_gain,
 								    24, 31, 24); /* Q8.24 */
 
-					/* Apply final gain. */
-					for (ch = 0; ch < nch; ch++) {
-						sample32_p =
-							(int32_t *)state->pre_delay_buffers[ch] +
-								div_start + inc;
-						sample = *sample32_p;
-						*sample32_p =
-							sat_int32(Q_MULTSR_32X32((int64_t)sample,
-										 total_gain,
-										 31, 24, 31));
-					}
+					sample32_p =
+						(int32_t *)state->pre_delay_buffers[ch] +
+							div_start + inc;
+					sample = *sample32_p;
+					*sample32_p =
+						sat_int32(Q_MULTSR_32X32((int64_t)sample,
+									 total_gain,
+									 31, 24, 31));
 					inc++;
 				}
 
@@ -447,7 +428,7 @@ void drc_compress_output(struct drc_state *state,
 			}
 		}
 
-		state->compressor_gain = x[3];
+		state->compressor_gain[ch] = x[3];
 	}
 }
 
@@ -463,11 +444,11 @@ void drc_compress_output(struct drc_state *state,
 static void drc_process_one_division(struct drc_state *state,
 				     const struct sof_drc_params *p,
 				     int nbyte,
-				     int nch)
+				     int ch)
 {
-	drc_update_detector_average(state, p, nbyte, nch);
-	drc_update_envelope(state, p);
-	drc_compress_output(state, p, nbyte, nch);
+	drc_update_detector_average(state, p, nbyte, ch);
+	drc_update_envelope(state, p, ch);
+	drc_compress_output(state, p, nbyte, ch);
 }
 
 void drc_default_pass(struct processing_module *mod,
@@ -543,9 +524,9 @@ static void drc_s16_default(struct processing_module *mod,
 	int samples = frames * nch;
 	struct drc_comp_data *cd = module_get_private_data(mod);
 	struct drc_state *state = &cd->state;
-	const struct sof_drc_params *p = &cd->config->params; /* Read-only */
 	int fragment_samples;
 	int fragment;
+	int ch;
 
 	if (!cd->enabled) {
 		/* Delay the input sample only and don't do other processing. This is used when the
@@ -557,8 +538,12 @@ static void drc_s16_default(struct processing_module *mod,
 	}
 
 	if (!state->processed) {
-		drc_update_envelope(state, p);
-		drc_compress_output(state, p, sizeof(int16_t), nch);
+		for (ch = 0; ch < nch; ch++) {
+			const struct sof_drc_params *p_ch = drc_get_params(cd, ch);
+
+			drc_update_envelope(state, p_ch, ch);
+			drc_compress_output(state, p_ch, sizeof(int16_t), ch);
+		}
 		state->processed = 1;
 	}
 
@@ -570,9 +555,16 @@ static void drc_s16_default(struct processing_module *mod,
 		drc_delay_input_sample_s16(state, source, sink, &x, &y, fragment_samples);
 		samples -= fragment_samples;
 
-		/* Process the input division (32 frames). */
-		if ((state->pre_delay_write_index & DRC_DIVISION_FRAMES_MASK) == 0)
-			drc_process_one_division(state, p, sizeof(int16_t), nch);
+		/* Process the input division (32 frames) per channel. */
+		if ((state->pre_delay_write_index & DRC_DIVISION_FRAMES_MASK) == 0) {
+			for (ch = 0; ch < nch; ch++) {
+				const struct sof_drc_params *p_ch =
+					drc_get_params(cd, ch);
+
+				drc_process_one_division(state, p_ch,
+							 sizeof(int16_t), ch);
+			}
+		}
 	}
 }
 #endif /* CONFIG_FORMAT_S16LE */
@@ -689,9 +681,9 @@ static void drc_s24_default(struct processing_module *mod,
 	int samples = frames * nch;
 	struct drc_comp_data *cd = module_get_private_data(mod);
 	struct drc_state *state = &cd->state;
-	const struct sof_drc_params *p = &cd->config->params; /* Read-only */
 	int fragment_samples;
 	int fragment;
+	int ch;
 
 	if (!cd->enabled) {
 		/* Delay the input sample only and don't do other processing. This is used when the
@@ -703,8 +695,12 @@ static void drc_s24_default(struct processing_module *mod,
 	}
 
 	if (!state->processed) {
-		drc_update_envelope(state, p);
-		drc_compress_output(state, p, sizeof(int32_t), nch);
+		for (ch = 0; ch < nch; ch++) {
+			const struct sof_drc_params *p_ch = drc_get_params(cd, ch);
+
+			drc_update_envelope(state, p_ch, ch);
+			drc_compress_output(state, p_ch, sizeof(int32_t), ch);
+		}
 		state->processed = 1;
 	}
 
@@ -718,9 +714,16 @@ static void drc_s24_default(struct processing_module *mod,
 		drc_delay_input_sample_s24(state, source, sink, &x, &y, fragment_samples);
 		samples -= fragment_samples;
 
-		/* Process the input division (32 frames). */
-		if ((state->pre_delay_write_index & DRC_DIVISION_FRAMES_MASK) == 0)
-			drc_process_one_division(state, p, sizeof(int32_t), nch);
+		/* Process the input division (32 frames) per channel. */
+		if ((state->pre_delay_write_index & DRC_DIVISION_FRAMES_MASK) == 0) {
+			for (ch = 0; ch < nch; ch++) {
+				const struct sof_drc_params *p_ch =
+					drc_get_params(cd, ch);
+
+				drc_process_one_division(state, p_ch,
+							 sizeof(int32_t), ch);
+			}
+		}
 	}
 }
 #endif /* CONFIG_FORMAT_S24LE */
@@ -737,9 +740,9 @@ static void drc_s32_default(struct processing_module *mod,
 	int samples = frames * nch;
 	struct drc_comp_data *cd = module_get_private_data(mod);
 	struct drc_state *state = &cd->state;
-	const struct sof_drc_params *p = &cd->config->params; /* Read-only */
 	int fragment_samples;
 	int fragment;
+	int ch;
 
 	if (!cd->enabled) {
 		/* Delay the input sample only and don't do other processing. This is used when the
@@ -751,8 +754,12 @@ static void drc_s32_default(struct processing_module *mod,
 	}
 
 	if (!state->processed) {
-		drc_update_envelope(state, p);
-		drc_compress_output(state, p, sizeof(int32_t), nch);
+		for (ch = 0; ch < nch; ch++) {
+			const struct sof_drc_params *p_ch = drc_get_params(cd, ch);
+
+			drc_update_envelope(state, p_ch, ch);
+			drc_compress_output(state, p_ch, sizeof(int32_t), ch);
+		}
 		state->processed = 1;
 	}
 
@@ -764,9 +771,16 @@ static void drc_s32_default(struct processing_module *mod,
 		drc_delay_input_sample_s32(state, source, sink, &x, &y, fragment_samples);
 		samples -= fragment_samples;
 
-		/* Process the input division (32 frames). */
-		if ((state->pre_delay_write_index & DRC_DIVISION_FRAMES_MASK) == 0)
-			drc_process_one_division(state, p, sizeof(int32_t), nch);
+		/* Process the input division (32 frames) per channel. */
+		if ((state->pre_delay_write_index & DRC_DIVISION_FRAMES_MASK) == 0) {
+			for (ch = 0; ch < nch; ch++) {
+				const struct sof_drc_params *p_ch =
+					drc_get_params(cd, ch);
+
+				drc_process_one_division(state, p_ch,
+							 sizeof(int32_t), ch);
+			}
+		}
 	}
 }
 #endif /* CONFIG_FORMAT_S32LE */
