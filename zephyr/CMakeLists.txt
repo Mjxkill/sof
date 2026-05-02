@@ -654,6 +654,10 @@ zephyr_library_sources_ifdef(CONFIG_COMP_DEINTERLEAVE_8
 	${SOF_AUDIO_PATH}/deinterleave_8/deinterleave_8.c
 )
 
+zephyr_library_sources_ifdef(CONFIG_COMP_MATRIX_2X8
+	${SOF_AUDIO_PATH}/matrix_2x8/matrix_2x8.c
+)
+
 zephyr_library_sources_ifdef(CONFIG_COMP_MODULE_ADAPTER
 	${SOF_AUDIO_PATH}/module_adapter/module_adapter.c
 	${SOF_AUDIO_PATH}/module_adapter/module_adapter_${ipc_suffix}.c
