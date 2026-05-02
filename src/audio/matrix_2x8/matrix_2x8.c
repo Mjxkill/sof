@@ -158,18 +158,21 @@ static int matrix_2x8_process(struct processing_module *mod,
 	uint32_t min_frames = UINT32_MAX;
 	uint32_t free_frames;
 	uint32_t avail_frames;
-	const int32_t *src_data[MATRIX_2X8_MAX_SOURCES];
-	int32_t *sink_data;
+	const int32_t *src_frame[MATRIX_2X8_MAX_SOURCES];
+	int32_t *sink_frame;
 	const void *src_ptr[MATRIX_2X8_MAX_SOURCES];
 	const void *src_start[MATRIX_2X8_MAX_SOURCES];
 	size_t src_size[MATRIX_2X8_MAX_SOURCES];
+	const char *src_end[MATRIX_2X8_MAX_SOURCES];
 	void *sink_ptr;
 	void *sink_start;
 	size_t sink_size;
+	char *sink_end;
 	int32_t (*gain)[MATRIX_2X8_OUT_CHANNELS];
 	int s, i, j, frame, ret;
 	int32_t sample;
 	int64_t acc;
+	const size_t frame_bytes = MATRIX_2X8_OUT_CHANNELS * sizeof(int32_t);
 
 	/* Refresh gains if a new blob was uploaded */
 	if (comp_is_new_data_blob_available(rt->blob_handler)) {
@@ -198,31 +201,39 @@ static int matrix_2x8_process(struct processing_module *mod,
 	if (min_frames == 0 || min_frames == UINT32_MAX)
 		return 0;
 
-	/* Acquire pointers — 8ch interleaved means min_frames * 8 * sizeof(int32_t) bytes */
+	/* Acquire pointers — 8ch interleaved means min_frames * 8 * sizeof(int32_t) bytes.
+	 * Capture circular-buffer geometry (start+size) so the mix loop honors wrap.
+	 */
 	for (s = 0; s < num_of_sources; s++) {
-		ret = source_get_data(sources[s],
-				      min_frames * MATRIX_2X8_OUT_CHANNELS * sizeof(int32_t),
+		ret = source_get_data(sources[s], min_frames * frame_bytes,
 				      &src_ptr[s], &src_start[s], &src_size[s]);
 		if (ret) {
 			while (--s >= 0)
 				source_release_data(sources[s], 0);
 			return -ENODATA;
 		}
-		src_data[s] = (const int32_t *)src_ptr[s];
+		src_frame[s] = (const int32_t *)src_ptr[s];
+		src_end[s] = (const char *)src_start[s] + src_size[s];
 	}
-	ret = sink_get_buffer(sinks[0],
-			      min_frames * MATRIX_2X8_OUT_CHANNELS * sizeof(int32_t),
+	ret = sink_get_buffer(sinks[0], min_frames * frame_bytes,
 			      &sink_ptr, &sink_start, &sink_size);
 	if (ret) {
 		for (s = 0; s < num_of_sources; s++)
 			source_release_data(sources[s], 0);
 		return -ENODATA;
 	}
-	sink_data = (int32_t *)sink_ptr;
+	sink_frame = (int32_t *)sink_ptr;
+	sink_end = (char *)sink_start + sink_size;
 
 	/*
-	 * Mix loop. For each frame and each output channel j, sum over all 16
-	 * inputs (8 channels × num_of_sources) with the Q1.31 gain matrix.
+	 * Mix loop with circular-buffer wrap handled per frame. The source/sink
+	 * pointers we got from source_get_data/sink_get_buffer point into a
+	 * circular buffer; the contract (source_api.h) says the caller MUST
+	 * honor circularity. Topology guarantees buffer_size is a multiple of
+	 * frame_bytes (period_bytes * N), so a frame never straddles end_addr —
+	 * wrap can only happen BETWEEN frames. We advance the per-frame pointer
+	 * by frame_bytes after each frame and wrap back to start if we hit end.
+	 *
 	 * num_of_sources < MAX is supported (single-source isolation test, etc.):
 	 * inputs from missing sources contribute 0 implicitly.
 	 */
@@ -231,25 +242,38 @@ static int matrix_2x8_process(struct processing_module *mod,
 			acc = 0;
 			for (s = 0; s < num_of_sources; s++) {
 				for (i = 0; i < MATRIX_2X8_OUT_CHANNELS; i++) {
-					sample = src_data[s][frame * MATRIX_2X8_OUT_CHANNELS + i];
+					sample = src_frame[s][i];
 					acc += ((int64_t)sample *
 						gain[s * MATRIX_2X8_OUT_CHANNELS + i][j]) >> 31;
 				}
 			}
 			if (acc > INT32_MAX)
-				sink_data[frame * MATRIX_2X8_OUT_CHANNELS + j] = INT32_MAX;
+				sink_frame[j] = INT32_MAX;
 			else if (acc < INT32_MIN)
-				sink_data[frame * MATRIX_2X8_OUT_CHANNELS + j] = INT32_MIN;
+				sink_frame[j] = INT32_MIN;
 			else
-				sink_data[frame * MATRIX_2X8_OUT_CHANNELS + j] = (int32_t)acc;
+				sink_frame[j] = (int32_t)acc;
+		}
+
+		for (s = 0; s < num_of_sources; s++) {
+			const char *next = (const char *)src_frame[s] + frame_bytes;
+
+			if (next >= src_end[s])
+				next = (const char *)src_start[s] + (next - src_end[s]);
+			src_frame[s] = (const int32_t *)next;
+		}
+		{
+			char *next = (char *)sink_frame + frame_bytes;
+
+			if (next >= sink_end)
+				next = (char *)sink_start + (next - sink_end);
+			sink_frame = (int32_t *)next;
 		}
 	}
 
-	sink_commit_buffer(sinks[0],
-			   min_frames * MATRIX_2X8_OUT_CHANNELS * sizeof(int32_t));
+	sink_commit_buffer(sinks[0], min_frames * frame_bytes);
 	for (s = 0; s < num_of_sources; s++)
-		source_release_data(sources[s],
-				    min_frames * MATRIX_2X8_OUT_CHANNELS * sizeof(int32_t));
+		source_release_data(sources[s], min_frames * frame_bytes);
 
 	return 0;
 }
