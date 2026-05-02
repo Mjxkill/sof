@@ -157,7 +157,8 @@ static int matrix_2x8_process(struct processing_module *mod,
 	struct matrix_2x8_runtime *rt = module_get_private_data(mod);
 	uint32_t min_frames = UINT32_MAX;
 	uint32_t free_frames;
-	uint32_t avail_frames;
+	uint32_t src_avail[MATRIX_2X8_MAX_SOURCES];
+	bool src_acquired[MATRIX_2X8_MAX_SOURCES];
 	const int32_t *src_frame[MATRIX_2X8_MAX_SOURCES];
 	int32_t *sink_frame;
 	const void *src_ptr[MATRIX_2X8_MAX_SOURCES];
@@ -188,12 +189,52 @@ static int matrix_2x8_process(struct processing_module *mod,
 	if (num_of_sinks != MATRIX_2X8_MAX_SINKS)
 		return -EINVAL;
 
-	/* min_frames over sources + sinks (8ch interleaved) */
+	/*
+	 * Per-source avail. For underrun_permitted sources (cross-pipeline B5),
+	 * source_get_data_frames_available reports stream->size (192) inflated
+	 * even when the buffer is empty. We must use the real avail to decide
+	 * whether to acquire — acquiring phantom data and releasing it would
+	 * desynchronise the cross-pipeline buffer pointers because release_data
+	 * advances r_ptr past data that was never written.
+	 *
+	 * Walk bsource_list to find the comp_buffer for each underrun-permitted
+	 * source. Read audio_stream.avail directly (which is NOT inflated by
+	 * underrun_permitted) to get the real producer-anchored avail.
+	 *
+	 * V5.4.1 E6.b iter4 fix: only sources with avail > 0 constrain min_frames.
+	 * A source with avail==0 is skipped entirely (no acquire, no release) and
+	 * contributes silence in the mix loop (matrix gain[s*8+i][j]=0 implicitly
+	 * via NULL frame pointer check below).
+	 */
 	for (s = 0; s < num_of_sources; s++) {
-		avail_frames = source_get_data_frames_available(sources[s]);
-		if (avail_frames < min_frames)
-			min_frames = avail_frames;
+		src_acquired[s] = false;
+		src_frame[s] = NULL;
+		src_end[s] = NULL;
+
+		if (source_get_underrun(sources[s])) {
+			struct list_item *bli;
+			uint32_t real_avail = 0;
+			bool found = false;
+
+			list_for_item(bli, &mod->dev->bsource_list) {
+				struct comp_buffer *b =
+					container_of(bli, struct comp_buffer, sink_list);
+				if (audio_stream_get_source(&b->stream) == sources[s]) {
+					real_avail = audio_stream_get_avail(&b->stream);
+					found = true;
+					break;
+				}
+			}
+			src_avail[s] = found ? real_avail / frame_bytes :
+				       source_get_data_frames_available(sources[s]);
+		} else {
+			src_avail[s] = source_get_data_frames_available(sources[s]);
+		}
+
+		if (src_avail[s] > 0 && src_avail[s] < min_frames)
+			min_frames = src_avail[s];
 	}
+
 	free_frames = sink_get_free_frames(sinks[0]);
 	if (free_frames < min_frames)
 		min_frames = free_frames;
@@ -201,46 +242,61 @@ static int matrix_2x8_process(struct processing_module *mod,
 	if (min_frames == 0 || min_frames == UINT32_MAX)
 		return 0;
 
-	/* Acquire pointers — 8ch interleaved means min_frames * 8 * sizeof(int32_t) bytes.
-	 * Capture circular-buffer geometry (start+size) so the mix loop honors wrap.
+	/*
+	 * Acquire only sources that have real data. Sources with src_avail==0
+	 * are left with src_frame[s]=NULL and skipped in the mix loop (silence
+	 * contribution). This avoids -ENODATA on src0 between ALSA bursts and
+	 * avoids phantom r_ptr drift on B5 cross-pipeline when empty.
 	 */
 	for (s = 0; s < num_of_sources; s++) {
+		if (src_avail[s] == 0)
+			continue;
+
 		ret = source_get_data(sources[s], min_frames * frame_bytes,
 				      &src_ptr[s], &src_start[s], &src_size[s]);
 		if (ret) {
-			while (--s >= 0)
-				source_release_data(sources[s], 0);
+			/* Defensive: should not happen since min_frames <= src_avail[s].
+			 * On failure for underrun source, treat as empty and continue.
+			 * Otherwise unwind already-acquired sources and bail.
+			 */
+			if (source_get_underrun(sources[s])) {
+				src_avail[s] = 0;
+				continue;
+			}
+			while (--s >= 0) {
+				if (src_acquired[s])
+					source_release_data(sources[s], 0);
+			}
 			return -ENODATA;
 		}
+		src_acquired[s] = true;
 		src_frame[s] = (const int32_t *)src_ptr[s];
 		src_end[s] = (const char *)src_start[s] + src_size[s];
 	}
+
 	ret = sink_get_buffer(sinks[0], min_frames * frame_bytes,
 			      &sink_ptr, &sink_start, &sink_size);
 	if (ret) {
 		for (s = 0; s < num_of_sources; s++)
-			source_release_data(sources[s], 0);
+			if (src_acquired[s])
+				source_release_data(sources[s], 0);
 		return -ENODATA;
 	}
 	sink_frame = (int32_t *)sink_ptr;
 	sink_end = (char *)sink_start + sink_size;
 
 	/*
-	 * Mix loop with circular-buffer wrap handled per frame. The source/sink
-	 * pointers we got from source_get_data/sink_get_buffer point into a
-	 * circular buffer; the contract (source_api.h) says the caller MUST
-	 * honor circularity. Topology guarantees buffer_size is a multiple of
-	 * frame_bytes (period_bytes * N), so a frame never straddles end_addr —
-	 * wrap can only happen BETWEEN frames. We advance the per-frame pointer
-	 * by frame_bytes after each frame and wrap back to start if we hit end.
-	 *
-	 * num_of_sources < MAX is supported (single-source isolation test, etc.):
-	 * inputs from missing sources contribute 0 implicitly.
+	 * Mix loop with circular-buffer wrap handled per frame. Sources with
+	 * src_frame[s]==NULL (avail==0) are skipped — their contribution is 0
+	 * (silence). Topology guarantees buffer_size is a multiple of frame_bytes
+	 * so wrap can only happen BETWEEN frames.
 	 */
 	for (frame = 0; frame < (int)min_frames; frame++) {
 		for (j = 0; j < MATRIX_2X8_OUT_CHANNELS; j++) {
 			acc = 0;
 			for (s = 0; s < num_of_sources; s++) {
+				if (src_frame[s] == NULL)
+					continue;
 				for (i = 0; i < MATRIX_2X8_OUT_CHANNELS; i++) {
 					sample = src_frame[s][i];
 					acc += ((int64_t)sample *
@@ -256,8 +312,11 @@ static int matrix_2x8_process(struct processing_module *mod,
 		}
 
 		for (s = 0; s < num_of_sources; s++) {
-			const char *next = (const char *)src_frame[s] + frame_bytes;
+			const char *next;
 
+			if (src_frame[s] == NULL)
+				continue;
+			next = (const char *)src_frame[s] + frame_bytes;
 			if (next >= src_end[s])
 				next = (const char *)src_start[s] + (next - src_end[s]);
 			src_frame[s] = (const int32_t *)next;
@@ -273,7 +332,8 @@ static int matrix_2x8_process(struct processing_module *mod,
 
 	sink_commit_buffer(sinks[0], min_frames * frame_bytes);
 	for (s = 0; s < num_of_sources; s++)
-		source_release_data(sources[s], min_frames * frame_bytes);
+		if (src_acquired[s])
+			source_release_data(sources[s], min_frames * frame_bytes);
 
 	return 0;
 }
