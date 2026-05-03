@@ -89,13 +89,20 @@ static int tee_1to2_process(struct processing_module *mod,
 	nch = audio_stream_get_channels(src);
 	samples = frames * nch;
 
+	/* V5.4.1 E6.b fix: output_stream_buffer.size is consumed in BYTES by the
+	 * framework's comp_update_buffer_produce(). Set per-sink in BYTES.
+	 * The previous code mixed units (set frames here, then called
+	 * module_update_buffer_position which only adds frame_bytes*frames to
+	 * out_buf[0]) — out_buf[0] over-produced and out_buf[1] under-produced
+	 * proportionally to nch, freezing both endpoints in 8ch mode.
+	 */
 	for (i = 0; i < num_out; i++) {
 		dst = out_buf[i].data;
 		audio_stream_copy(src, 0, dst, 0, samples);
-		out_buf[i].size = frames;
+		out_buf[i].size = audio_stream_frame_bytes(dst) * frames;
 	}
 
-	module_update_buffer_position(&in_buf[0], &out_buf[0], frames);
+	in_buf[0].consumed = audio_stream_frame_bytes(src) * frames;
 	return 0;
 }
 

@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+config COMP_MATRIX_2X8
+	bool "Matrix 2x8 -> 8 native interleaved component (V5.4.1 Phase 1a.3 E6.b)"
+	default y
+	help
+	  Native 8-channel interleaved matrix mixer: 2 sources x 8ch -> 1 sink x 8ch.
+	  Per-cell Q1.31 gains form a 16x8 matrix (128 cells = 512 B ALSA bytes blob).
+	  Replaces the mixer16 + deinterleave_8 x 2 + interleave_8 chain by keeping
+	  data 8ch interleaved end-to-end, eliminating mono branched buffers and the
+	  related F++ / pipeline_complete walk-not-visited issues. Used at the V5.4.1
+	  matrix routing stage between input strips (8 mics post-strip-IN) and the
+	  ASIO play 8ch on one side, and the 8 strip-OUT inputs on the other.

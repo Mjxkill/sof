@@ -11,6 +11,7 @@
 #include <sof/audio/pipeline.h>
 #include <sof/audio/ipc-config.h>
 #include <sof/common.h>
+#include <sof/lib/mailbox.h>
 #include <rtos/panic.h>
 #include <sof/ipc/msg.h>
 #include <rtos/alloc.h>
@@ -1079,6 +1080,29 @@ static int host_reset(struct comp_dev *dev)
 static int host_copy(struct comp_dev *dev)
 {
 	struct host_data *hd = comp_get_drvdata(dev);
+
+	/* DIAG E6.b: count host_copy invocations + dev->state per direction.
+	 * Local counter, mailbox publish every 256 ticks (~500ms) only.
+	 * 0x320: play count, 0x324: cap count, 0x328: play state, 0x32C: cap state.
+	 * REMOVE after diag.
+	 */
+	{
+		static volatile uint32_t dbg_host_play_count;
+		static volatile uint32_t dbg_host_cap_count;
+		if (dev->direction == SOF_IPC_STREAM_PLAYBACK) {
+			dbg_host_play_count++;
+			if ((dbg_host_play_count & 0x0F) == 1) {
+				mailbox_sw_reg_write(0x320, dbg_host_play_count);
+				mailbox_sw_reg_write(0x328, dev->state);
+			}
+		} else {
+			dbg_host_cap_count++;
+			if ((dbg_host_cap_count & 0x0F) == 1) {
+				mailbox_sw_reg_write(0x324, dbg_host_cap_count);
+				mailbox_sw_reg_write(0x32C, dev->state);
+			}
+		}
+	}
 
 	if (dev->state != COMP_STATE_ACTIVE)
 		return 0;
