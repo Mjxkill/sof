@@ -25,6 +25,7 @@
 #define MATRIX_2X8_MAX_SINKS     1
 #define MATRIX_2X8_OUT_CHANNELS  8
 #define MATRIX_2X8_TOTAL_INPUTS  (MATRIX_2X8_MAX_SOURCES * MATRIX_2X8_OUT_CHANNELS)
+#define MATRIX_2X8_PERIOD_FRAMES 96    /* 2ms @ 48kHz, matches topology DMA period */
 
 struct matrix_2x8_gains {
 	/* gain[input_index 0..15][output_channel 0..7] in Q1.31 signed */

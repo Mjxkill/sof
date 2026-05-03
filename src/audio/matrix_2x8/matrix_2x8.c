@@ -146,34 +146,35 @@ static int matrix_2x8_get_config(struct processing_module *mod,
 }
 
 /*
- * Process loop — 2 sources × 8ch interleaved -> 1 sink × 8ch interleaved.
+ * Process loop — AUDIO_STREAM mode (V5.4.1 E6.b iter7).
+ *
+ * The matrix_2x8 component now uses the AUDIO_STREAM dispatch path
+ * (module_adapter_audio_stream_type_copy) instead of SOURCE_SINK. The
+ * framework calls module_single_sink_setup which computes input_buffers[s].size
+ * via audio_stream_avail_frames_aligned for each source — this is the same
+ * path used by eq/drc/pga and properly handles TDM 8-slot frame alignment.
+ *
  * For each frame, each output channel j is the Q1.31-weighted sum of the 16
- * input channels (8 from src 0 + 8 from src 1).
+ * input channels (8 from src 0 + 8 from src 1). audio_stream_read/write_frag_s32
+ * gives wrap-safe access to circular buffers (no manual wrap handling needed).
+ *
+ * Sources with input_buffers[s].size < min_frames contribute silence for the
+ * frames beyond their available count (mix loop skip).
  */
 static int matrix_2x8_process(struct processing_module *mod,
-			      struct sof_source **sources, int num_of_sources,
-			      struct sof_sink **sinks, int num_of_sinks)
+			      struct input_stream_buffer *input_buffers, int num_input_buffers,
+			      struct output_stream_buffer *output_buffers, int num_output_buffers)
 {
 	struct matrix_2x8_runtime *rt = module_get_private_data(mod);
+	struct audio_stream *src_stream[MATRIX_2X8_MAX_SOURCES];
+	struct audio_stream *sink_stream;
+	uint32_t src_frames[MATRIX_2X8_MAX_SOURCES];
 	uint32_t min_frames = UINT32_MAX;
-	uint32_t free_frames;
-	uint32_t src_avail[MATRIX_2X8_MAX_SOURCES];
-	bool src_acquired[MATRIX_2X8_MAX_SOURCES];
-	const int32_t *src_frame[MATRIX_2X8_MAX_SOURCES];
-	int32_t *sink_frame;
-	const void *src_ptr[MATRIX_2X8_MAX_SOURCES];
-	const void *src_start[MATRIX_2X8_MAX_SOURCES];
-	size_t src_size[MATRIX_2X8_MAX_SOURCES];
-	const char *src_end[MATRIX_2X8_MAX_SOURCES];
-	void *sink_ptr;
-	void *sink_start;
-	size_t sink_size;
-	char *sink_end;
 	int32_t (*gain)[MATRIX_2X8_OUT_CHANNELS];
-	int s, i, j, frame, ret;
+	int s, i, j;
+	uint32_t frame;
 	int32_t sample;
 	int64_t acc;
-	const size_t frame_bytes = MATRIX_2X8_OUT_CHANNELS * sizeof(int32_t);
 
 	/* Refresh gains if a new blob was uploaded */
 	if (comp_is_new_data_blob_available(rt->blob_handler)) {
@@ -184,156 +185,79 @@ static int matrix_2x8_process(struct processing_module *mod,
 	}
 	gain = rt->gains.gain;
 
-	if (num_of_sources <= 0 || num_of_sources > MATRIX_2X8_MAX_SOURCES)
+	if (num_input_buffers <= 0 || num_input_buffers > MATRIX_2X8_MAX_SOURCES)
 		return -EINVAL;
-	if (num_of_sinks != MATRIX_2X8_MAX_SINKS)
+	if (num_output_buffers != MATRIX_2X8_MAX_SINKS)
 		return -EINVAL;
 
 	/*
-	 * Per-source avail. For underrun_permitted sources (cross-pipeline B5),
-	 * source_get_data_frames_available reports stream->size (192) inflated
-	 * even when the buffer is empty. We must use the real avail to decide
-	 * whether to acquire — acquiring phantom data and releasing it would
-	 * desynchronise the cross-pipeline buffer pointers because release_data
-	 * advances r_ptr past data that was never written.
+	 * The framework computed input_buffers[s].size = aligned frames available
+	 * for each source via audio_stream_avail_frames_aligned (in
+	 * module_single_sink_setup). It is already bounded by sink free.
 	 *
-	 * Walk bsource_list to find the comp_buffer for each underrun-permitted
-	 * source. Read audio_stream.avail directly (which is NOT inflated by
-	 * underrun_permitted) to get the real producer-anchored avail.
+	 * V5.4.1 E6.b iter8: Use the MAX over all sources as min_frames,
+	 * NOT the MIN. Reason: cross-pipeline B5 with overrun_permitted +
+	 * underrun_permitted state oscillation can return small aligned values
+	 * (e.g. 8 frames TDM-aligned) even when the primary host PCM (B0) has
+	 * a full period (96 frames) available. With MIN, B5 brides matrix to
+	 * the small value → 8 × 500 = 4k fps observed.
 	 *
-	 * V5.4.1 E6.b iter4 fix: only sources with avail > 0 constrain min_frames.
-	 * A source with avail==0 is skipped entirely (no acquire, no release) and
-	 * contributes silence in the mix loop (matrix gain[s*8+i][j]=0 implicitly
-	 * via NULL frame pointer check below).
+	 * With MAX, matrix produces what the largest source has. Sources whose
+	 * src_frames[s] < frame contribute silence implicitly (skip in mix loop).
+	 * Output follows the primary source rate.
 	 */
-	for (s = 0; s < num_of_sources; s++) {
-		src_acquired[s] = false;
-		src_frame[s] = NULL;
-		src_end[s] = NULL;
-
-		if (source_get_underrun(sources[s])) {
-			struct list_item *bli;
-			uint32_t real_avail = 0;
-			bool found = false;
-
-			list_for_item(bli, &mod->dev->bsource_list) {
-				struct comp_buffer *b =
-					container_of(bli, struct comp_buffer, sink_list);
-				if (audio_stream_get_source(&b->stream) == sources[s]) {
-					real_avail = audio_stream_get_avail(&b->stream);
-					found = true;
-					break;
-				}
-			}
-			src_avail[s] = found ? real_avail / frame_bytes :
-				       source_get_data_frames_available(sources[s]);
-		} else {
-			src_avail[s] = source_get_data_frames_available(sources[s]);
-		}
-
-		if (src_avail[s] > 0 && src_avail[s] < min_frames)
-			min_frames = src_avail[s];
+	for (s = 0; s < num_input_buffers; s++) {
+		src_stream[s] = input_buffers[s].data;
+		src_frames[s] = input_buffers[s].size;
+		if (src_frames[s] > min_frames || min_frames == UINT32_MAX)
+			min_frames = src_frames[s];
 	}
-
-	free_frames = sink_get_free_frames(sinks[0]);
-	if (free_frames < min_frames)
-		min_frames = free_frames;
+	sink_stream = output_buffers[0].data;
 
 	if (min_frames == 0 || min_frames == UINT32_MAX)
 		return 0;
 
-	/*
-	 * Acquire only sources that have real data. Sources with src_avail==0
-	 * are left with src_frame[s]=NULL and skipped in the mix loop (silence
-	 * contribution). This avoids -ENODATA on src0 between ALSA bursts and
-	 * avoids phantom r_ptr drift on B5 cross-pipeline when empty.
+	/* Mix loop. audio_stream_read/write_frag_s32 handle wrap automatically.
+	 * Sources whose src_frames[s] < frame contribute silence implicitly via
+	 * skip — their gain contribution is 0 for those frames.
 	 */
-	for (s = 0; s < num_of_sources; s++) {
-		if (src_avail[s] == 0)
-			continue;
-
-		ret = source_get_data(sources[s], min_frames * frame_bytes,
-				      &src_ptr[s], &src_start[s], &src_size[s]);
-		if (ret) {
-			/* Defensive: should not happen since min_frames <= src_avail[s].
-			 * On failure for underrun source, treat as empty and continue.
-			 * Otherwise unwind already-acquired sources and bail.
-			 */
-			if (source_get_underrun(sources[s])) {
-				src_avail[s] = 0;
-				continue;
-			}
-			while (--s >= 0) {
-				if (src_acquired[s])
-					source_release_data(sources[s], 0);
-			}
-			return -ENODATA;
-		}
-		src_acquired[s] = true;
-		src_frame[s] = (const int32_t *)src_ptr[s];
-		src_end[s] = (const char *)src_start[s] + src_size[s];
-	}
-
-	ret = sink_get_buffer(sinks[0], min_frames * frame_bytes,
-			      &sink_ptr, &sink_start, &sink_size);
-	if (ret) {
-		for (s = 0; s < num_of_sources; s++)
-			if (src_acquired[s])
-				source_release_data(sources[s], 0);
-		return -ENODATA;
-	}
-	sink_frame = (int32_t *)sink_ptr;
-	sink_end = (char *)sink_start + sink_size;
-
-	/*
-	 * Mix loop with circular-buffer wrap handled per frame. Sources with
-	 * src_frame[s]==NULL (avail==0) are skipped — their contribution is 0
-	 * (silence). Topology guarantees buffer_size is a multiple of frame_bytes
-	 * so wrap can only happen BETWEEN frames.
-	 */
-	for (frame = 0; frame < (int)min_frames; frame++) {
+	for (frame = 0; frame < min_frames; frame++) {
 		for (j = 0; j < MATRIX_2X8_OUT_CHANNELS; j++) {
 			acc = 0;
-			for (s = 0; s < num_of_sources; s++) {
-				if (src_frame[s] == NULL)
+			for (s = 0; s < num_input_buffers; s++) {
+				if (frame >= src_frames[s])
 					continue;
 				for (i = 0; i < MATRIX_2X8_OUT_CHANNELS; i++) {
-					sample = src_frame[s][i];
+					int32_t *src_ptr = audio_stream_read_frag_s32(
+						src_stream[s],
+						frame * MATRIX_2X8_OUT_CHANNELS + i);
+					sample = *src_ptr;
 					acc += ((int64_t)sample *
 						gain[s * MATRIX_2X8_OUT_CHANNELS + i][j]) >> 31;
 				}
 			}
-			if (acc > INT32_MAX)
-				sink_frame[j] = INT32_MAX;
-			else if (acc < INT32_MIN)
-				sink_frame[j] = INT32_MIN;
-			else
-				sink_frame[j] = (int32_t)acc;
-		}
-
-		for (s = 0; s < num_of_sources; s++) {
-			const char *next;
-
-			if (src_frame[s] == NULL)
-				continue;
-			next = (const char *)src_frame[s] + frame_bytes;
-			if (next >= src_end[s])
-				next = (const char *)src_start[s] + (next - src_end[s]);
-			src_frame[s] = (const int32_t *)next;
-		}
-		{
-			char *next = (char *)sink_frame + frame_bytes;
-
-			if (next >= sink_end)
-				next = (char *)sink_start + (next - sink_end);
-			sink_frame = (int32_t *)next;
+			{
+				int32_t *dst_ptr = audio_stream_write_frag_s32(
+					sink_stream,
+					frame * MATRIX_2X8_OUT_CHANNELS + j);
+				if (acc > INT32_MAX)
+					*dst_ptr = INT32_MAX;
+				else if (acc < INT32_MIN)
+					*dst_ptr = INT32_MIN;
+				else
+					*dst_ptr = (int32_t)acc;
+			}
 		}
 	}
 
-	sink_commit_buffer(sinks[0], min_frames * frame_bytes);
-	for (s = 0; s < num_of_sources; s++)
-		if (src_acquired[s])
-			source_release_data(sources[s], min_frames * frame_bytes);
+	/* Inform framework: produced and consumed bytes.
+	 * output_buffers[0].size is in BYTES. input_buffers[s].consumed is in BYTES.
+	 */
+	output_buffers[0].size = audio_stream_frame_bytes(sink_stream) * min_frames;
+	for (s = 0; s < num_input_buffers; s++) {
+		uint32_t consumed = (src_frames[s] < min_frames) ? src_frames[s] : min_frames;
+		input_buffers[s].consumed = audio_stream_frame_bytes(src_stream[s]) * consumed;
+	}
 
 	return 0;
 }
@@ -382,7 +306,7 @@ static int matrix_2x8_free(struct processing_module *mod)
 static const struct module_interface matrix_2x8_interface = {
 	.init = matrix_2x8_init,
 	.prepare = matrix_2x8_prepare,
-	.process = matrix_2x8_process,
+	.process_audio_stream = matrix_2x8_process,
 	.set_configuration = matrix_2x8_set_config,
 	.get_configuration = matrix_2x8_get_config,
 	.trigger = matrix_2x8_trigger,
