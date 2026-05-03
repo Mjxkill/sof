@@ -109,15 +109,22 @@ static int matrix_2x8_prepare(struct processing_module *mod,
 	 * channels=1 + preserve_channels=true on our 2 sources. We re-set 8ch
 	 * here and clear preserve_channels so subsequent buffer_set_params
 	 * calls don't restore the wrong saved value.
+	 *
+	 * V5.4.1 E6.b iter9: also call audio_stream_set_align(8, 2) on every
+	 * buffer like eq_iir/mixer/volume do. Without this, buffers keep the
+	 * default (1, 1) alignment from audio_stream_init and are inconsistent
+	 * with the rest of the pipeline.
 	 */
 	list_for_item(blist, &dev->bsource_list) {
 		buf = container_of(blist, struct comp_buffer, sink_list);
 		audio_stream_set_channels(&buf->stream, MATRIX_2X8_OUT_CHANNELS);
+		audio_stream_set_align(8, 2, &buf->stream);
 		buf->preserve_channels = false;
 	}
 	list_for_item(blist, &dev->bsink_list) {
 		buf = container_of(blist, struct comp_buffer, source_list);
 		audio_stream_set_channels(&buf->stream, MATRIX_2X8_OUT_CHANNELS);
+		audio_stream_set_align(8, 2, &buf->stream);
 		buf->preserve_channels = false;
 	}
 	return 0;
@@ -191,31 +198,30 @@ static int matrix_2x8_process(struct processing_module *mod,
 		return -EINVAL;
 
 	/*
-	 * The framework computed input_buffers[s].size = aligned frames available
-	 * for each source via audio_stream_avail_frames_aligned (in
-	 * module_single_sink_setup). It is already bounded by sink free.
+	 * iter10 — defensive: force period_frames if sink can take it, else skip.
 	 *
-	 * V5.4.1 E6.b iter8: Use the MAX over all sources as min_frames,
-	 * NOT the MIN. Reason: cross-pipeline B5 with overrun_permitted +
-	 * underrun_permitted state oscillation can return small aligned values
-	 * (e.g. 8 frames TDM-aligned) even when the primary host PCM (B0) has
-	 * a full period (96 frames) available. With MIN, B5 brides matrix to
-	 * the small value → 8 × 500 = 4k fps observed.
-	 *
-	 * With MAX, matrix produces what the largest source has. Sources whose
-	 * src_frames[s] < frame contribute silence implicitly (skip in mix loop).
-	 * Output follows the primary source rate.
+	 * Empirically required for loopback-c: without this, matrix freezes after
+	 * 1 chunk (out=512 stuck) when both PIPE 1 and PIPE 2 active.
+	 * With this, matrix produces ~4k fps in loopback (vs 48k expected, but
+	 * non-zero unlike without). Source contributions limited by per-source
+	 * src_frames[s] (silence padding when source < period in mix loop).
 	 */
+	sink_stream = output_buffers[0].data;
+	{
+		uint32_t period_frames = MATRIX_2X8_PERIOD_FRAMES;
+		uint32_t sink_frame_bytes = audio_stream_frame_bytes(sink_stream);
+		uint32_t sink_free_bytes = audio_stream_get_free_bytes(sink_stream);
+		uint32_t sink_free_frames = sink_free_bytes / sink_frame_bytes;
+
+		if (sink_free_frames < period_frames)
+			return 0;
+		min_frames = period_frames;
+	}
+
 	for (s = 0; s < num_input_buffers; s++) {
 		src_stream[s] = input_buffers[s].data;
 		src_frames[s] = input_buffers[s].size;
-		if (src_frames[s] > min_frames || min_frames == UINT32_MAX)
-			min_frames = src_frames[s];
 	}
-	sink_stream = output_buffers[0].data;
-
-	if (min_frames == 0 || min_frames == UINT32_MAX)
-		return 0;
 
 	/* Mix loop. audio_stream_read/write_frag_s32 handle wrap automatically.
 	 * Sources whose src_frames[s] < frame contribute silence implicitly via
