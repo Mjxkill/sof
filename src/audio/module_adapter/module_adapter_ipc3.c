@@ -139,12 +139,51 @@ static int module_source_status_count(struct comp_dev *dev, uint32_t status)
 	return count;
 }
 
+/* V6.0 F5: detect whether all sources of `dev` are in the SAME pipeline as
+ * `dev`. NULL-safe (cb->source can be NULL during lifecycle).
+ *
+ * - Returns true if every connected source comp lives in dev->pipeline,
+ *   meaning the multi-source comp is NOT cross-pipeline-coupled and the
+ *   state machine can transition without checking sibling pipelines.
+ * - Returns false if any source is missing (cb->source == NULL) — defensive
+ *   so the legacy cross-pipeline gating runs and we don't mis-trigger.
+ * - Returns false if any source is in a different pipeline (= true
+ *   cross-pipeline case, e.g. matrix_2x8 + B5 from PIPE 1 cap).
+ */
+static bool module_sources_all_intra_pipeline(struct comp_dev *dev)
+{
+	struct list_item *blist;
+	struct comp_buffer *cb;
+
+	if (!dev->pipeline)
+		return false;
+
+	list_for_item(blist, &dev->bsource_list) {
+		cb = container_of(blist, struct comp_buffer, sink_list);
+		if (!cb->source || !cb->source->pipeline)
+			return false;
+		if (cb->source->pipeline != dev->pipeline)
+			return false;
+	}
+	return true;
+}
+
 int module_adapter_set_state(struct processing_module *mod, struct comp_dev *dev,
 			     int cmd)
 {
 	if (mod->num_of_sources > 1) {
 		bool sources_active;
 		int ret;
+
+		/* V6.0 F5: short-circuit when all sources are intra-pipeline.
+		 * The cross-pipeline gating below is meaningful only when at
+		 * least one source belongs to another pipeline (= the trigger
+		 * order between siblings can race). For pure intra-pipeline
+		 * multi-source comps, fall back to the canonical comp_set_state
+		 * path with no PATH_STOP.
+		 */
+		if (module_sources_all_intra_pipeline(dev))
+			return comp_set_state(dev, cmd);
 
 		sources_active = module_source_status_count(dev, COMP_STATE_ACTIVE) ||
 				 module_source_status_count(dev, COMP_STATE_PAUSED);
