@@ -56,109 +56,88 @@ static void multiband_drc_process_emp_crossover(struct multiband_drc_state *stat
 }
 
 #if CONFIG_FORMAT_S16LE
-static void multiband_drc_s16_process_drc(struct drc_state *state,
-					  const struct sof_drc_params *p,
-					  int32_t *buf_src,
-					  int32_t *buf_sink,
-					  int nch)
+/* V6.0: process one mono channel per call. State is per [band][ch], with
+ * its own pre_delay buffer at index [0]. The outer loop in the *_default
+ * functions handles band and channel iteration.
+ */
+static void multiband_drc_s16_process_drc_one_ch(struct drc_state *state,
+						 const struct sof_drc_params *p,
+						 int32_t *buf_src,
+						 int32_t *buf_sink)
 {
 	int16_t *pd_write;
 	int16_t *pd_read;
-	int ch;
 	int pd_write_index;
 	int pd_read_index;
 
 	if (p->enabled && !state->processed) {
-		for (ch = 0; ch < nch; ++ch) {
-			drc_update_envelope(state, p, ch);
-			drc_compress_output(state, p, 2, ch);
-		}
+		drc_update_envelope(state, p, 0);
+		drc_compress_output(state, p, 2, 0);
 		state->processed = 1;
 	}
 
 	pd_write_index = state->pre_delay_write_index;
 	pd_read_index = state->pre_delay_read_index;
 
-	for (ch = 0; ch < nch; ++ch) {
-		pd_write = (int16_t *)state->pre_delay_buffers[ch] + pd_write_index;
-		pd_read = (int16_t *)state->pre_delay_buffers[ch] + pd_read_index;
-		*pd_write = sat_int16(Q_SHIFT_RND(*buf_src, 31, 15));
-		*buf_sink = *pd_read << 16;
-
-		buf_src++;
-		buf_sink++;
-	}
+	pd_write = (int16_t *)state->pre_delay_buffers[0] + pd_write_index;
+	pd_read = (int16_t *)state->pre_delay_buffers[0] + pd_read_index;
+	*pd_write = sat_int16(Q_SHIFT_RND(*buf_src, 31, 15));
+	*buf_sink = *pd_read << 16;
 
 	pd_write_index = (pd_write_index + 1) & DRC_MAX_PRE_DELAY_FRAMES_MASK;
 	pd_read_index = (pd_read_index + 1) & DRC_MAX_PRE_DELAY_FRAMES_MASK;
 	state->pre_delay_write_index = pd_write_index;
 	state->pre_delay_read_index = pd_read_index;
 
-	/* Only perform delay frames by early return here if not enabled */
 	if (!p->enabled)
 		return;
 
-	/* Process the input division (32 frames) per channel. */
 	if (!(pd_write_index & DRC_DIVISION_FRAMES_MASK)) {
-		for (ch = 0; ch < nch; ++ch) {
-			drc_update_detector_average(state, p, 2, ch);
-			drc_update_envelope(state, p, ch);
-			drc_compress_output(state, p, 2, ch);
-		}
+		drc_update_detector_average(state, p, 2, 0);
+		drc_update_envelope(state, p, 0);
+		drc_compress_output(state, p, 2, 0);
 	}
 }
 #endif /* CONFIG_FORMAT_S16LE */
 
 #if CONFIG_FORMAT_S24LE || CONFIG_FORMAT_S32LE
-static void multiband_drc_s32_process_drc(struct drc_state *state,
-					  const struct sof_drc_params *p,
-					  int32_t *buf_src,
-					  int32_t *buf_sink,
-					  int nch)
+/* V6.0: mono per-call. See multiband_drc_s16_process_drc_one_ch for rationale. */
+static void multiband_drc_s32_process_drc_one_ch(struct drc_state *state,
+						 const struct sof_drc_params *p,
+						 int32_t *buf_src,
+						 int32_t *buf_sink)
 {
 	int32_t *pd_write;
 	int32_t *pd_read;
-	int ch;
 	int pd_write_index;
 	int pd_read_index;
 
 	if (p->enabled && !state->processed) {
-		for (ch = 0; ch < nch; ++ch) {
-			drc_update_envelope(state, p, ch);
-			drc_compress_output(state, p, 4, ch);
-		}
+		drc_update_envelope(state, p, 0);
+		drc_compress_output(state, p, 4, 0);
 		state->processed = 1;
 	}
 
 	pd_write_index = state->pre_delay_write_index;
 	pd_read_index = state->pre_delay_read_index;
 
-	for (ch = 0; ch < nch; ++ch) {
-		pd_write = (int32_t *)state->pre_delay_buffers[ch] + pd_write_index;
-		pd_read = (int32_t *)state->pre_delay_buffers[ch] + pd_read_index;
-		*pd_write = *buf_src;
-		*buf_sink = *pd_read;
-
-		buf_src++;
-		buf_sink++;
-	}
+	pd_write = (int32_t *)state->pre_delay_buffers[0] + pd_write_index;
+	pd_read = (int32_t *)state->pre_delay_buffers[0] + pd_read_index;
+	*pd_write = *buf_src;
+	*buf_sink = *pd_read;
 
 	pd_write_index = (pd_write_index + 1) & DRC_MAX_PRE_DELAY_FRAMES_MASK;
 	pd_read_index = (pd_read_index + 1) & DRC_MAX_PRE_DELAY_FRAMES_MASK;
 	state->pre_delay_write_index = pd_write_index;
 	state->pre_delay_read_index = pd_read_index;
 
-	/* Only perform delay frames by early return here if not enabled */
 	if (!p->enabled)
 		return;
 
-	/* Process the input division (32 frames) per channel. */
 	if (!(pd_write_index & DRC_DIVISION_FRAMES_MASK)) {
-		for (ch = 0; ch < nch; ++ch) {
-			drc_update_detector_average(state, p, 4, ch);
-			drc_update_envelope(state, p, ch);
-			drc_compress_output(state, p, 4, ch);
-		}
+		drc_update_detector_average(state, p, 4, 0);
+		drc_update_envelope(state, p, 0);
+		drc_compress_output(state, p, 4, 0);
 	}
 }
 #endif /* CONFIG_FORMAT_S24LE || CONFIG_FORMAT_S32LE */
@@ -210,6 +189,17 @@ static void multiband_drc_process_deemp(struct multiband_drc_state *state,
   *                                          :                              :
   *                                          :buf_drc_src[nch*nband]        :buf_sink[nch]
   */
+/* V6.0: helper — get per-channel config (matches multiband_drc.c version). */
+static inline struct sof_multiband_drc_config *
+mbdrc_cfg_for_ch(struct multiband_drc_comp_data *cd, int ch)
+{
+	if (cd->n_configs <= 1)
+		return cd->config;
+	int idx = (ch < cd->n_configs) ? ch : (cd->n_configs - 1);
+	return (struct sof_multiband_drc_config *)
+		((uint8_t *)cd->config + (size_t)idx * cd->size_per_config);
+}
+
 #if CONFIG_FORMAT_S16LE
 static void multiband_drc_s16_default(const struct processing_module *mod,
 				      const struct audio_stream *source,
@@ -251,13 +241,21 @@ static void multiband_drc_s16_default(const struct processing_module *mod,
 							    buf_src, buf_drc_src,
 							    enable_emp_deemp, nch, nband);
 
+			/* V6.0: for each band, process each channel with its own
+			 * state[band][ch] and per-channel drc_coef[band].
+			 */
 			band_buf_drc_src = buf_drc_src;
 			band_buf_drc_sink = buf_drc_sink;
 			for (band = 0; band < nband; ++band) {
-				multiband_drc_s16_process_drc(&state->drc[band],
-							      &cd->config->drc_coef[band],
-							      band_buf_drc_src, band_buf_drc_sink,
-							      nch);
+				for (ch = 0; ch < nch; ++ch) {
+					struct sof_multiband_drc_config *cfg =
+						mbdrc_cfg_for_ch(cd, ch);
+					multiband_drc_s16_process_drc_one_ch(
+						&state->drc[band][ch],
+						&cfg->drc_coef[band],
+						band_buf_drc_src + ch,
+						band_buf_drc_sink + ch);
+				}
 				band_buf_drc_src += PLATFORM_MAX_CHANNELS;
 				band_buf_drc_sink += PLATFORM_MAX_CHANNELS;
 			}
@@ -321,10 +319,15 @@ static void multiband_drc_s24_default(const struct processing_module *mod,
 			band_buf_drc_src = buf_drc_src;
 			band_buf_drc_sink = buf_drc_sink;
 			for (band = 0; band < nband; ++band) {
-				multiband_drc_s32_process_drc(&state->drc[band],
-							      &cd->config->drc_coef[band],
-							      band_buf_drc_src, band_buf_drc_sink,
-							      nch);
+				for (ch = 0; ch < nch; ++ch) {
+					struct sof_multiband_drc_config *cfg =
+						mbdrc_cfg_for_ch(cd, ch);
+					multiband_drc_s32_process_drc_one_ch(
+						&state->drc[band][ch],
+						&cfg->drc_coef[band],
+						band_buf_drc_src + ch,
+						band_buf_drc_sink + ch);
+				}
 				band_buf_drc_src += PLATFORM_MAX_CHANNELS;
 				band_buf_drc_sink += PLATFORM_MAX_CHANNELS;
 			}
@@ -388,10 +391,15 @@ static void multiband_drc_s32_default(const struct processing_module *mod,
 			band_buf_drc_src = buf_drc_src;
 			band_buf_drc_sink = buf_drc_sink;
 			for (band = 0; band < nband; ++band) {
-				multiband_drc_s32_process_drc(&state->drc[band],
-							      &cd->config->drc_coef[band],
-							      band_buf_drc_src, band_buf_drc_sink,
-							      nch);
+				for (ch = 0; ch < nch; ++ch) {
+					struct sof_multiband_drc_config *cfg =
+						mbdrc_cfg_for_ch(cd, ch);
+					multiband_drc_s32_process_drc_one_ch(
+						&state->drc[band][ch],
+						&cfg->drc_coef[band],
+						band_buf_drc_src + ch,
+						band_buf_drc_sink + ch);
+				}
 				band_buf_drc_src += PLATFORM_MAX_CHANNELS;
 				band_buf_drc_sink += PLATFORM_MAX_CHANNELS;
 			}

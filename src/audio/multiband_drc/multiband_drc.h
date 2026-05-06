@@ -20,11 +20,17 @@
 
 /**
  * Stores the state of the sub-components in Multiband DRC
+ *
+ * V6.0: drc state is now per-band PER-CHANNEL (was per-band only). Layout
+ * [band][ch] is cache-friendly with the existing process loop pattern
+ * `for band { for ch }`. emphasis/crossover/deemphasis already per-ch.
+ *
+ * Each drc[band][ch] is mono — only pre_delay_buffers[0] is allocated.
  */
 struct multiband_drc_state {
 	struct iir_state_df2t emphasis[PLATFORM_MAX_CHANNELS];
 	struct crossover_state crossover[PLATFORM_MAX_CHANNELS];
-	struct drc_state drc[SOF_MULTIBAND_DRC_MAX_BANDS];
+	struct drc_state drc[SOF_MULTIBAND_DRC_MAX_BANDS][PLATFORM_MAX_CHANNELS];
 	struct iir_state_df2t deemphasis[PLATFORM_MAX_CHANNELS];
 };
 
@@ -37,12 +43,20 @@ typedef void (*multiband_drc_func)(const struct processing_module *mod,
 struct multiband_drc_comp_data {
 	struct multiband_drc_state state;        /**< compressor state */
 	struct comp_data_blob_handler *model_handler;
-	struct sof_multiband_drc_config *config; /**< pointer to setup blob */
+	struct sof_multiband_drc_config *config; /**< pointer to setup blob (1st cfg) */
 	bool config_ready;                       /**< set when fully received */
 	enum sof_ipc_frame source_format;        /**< source frame format */
 	bool process_enabled;                    /**< true if component is enabled */
 	multiband_drc_func multiband_drc_func;   /**< processing function */
 	crossover_split crossover_split;         /**< crossover n-way split func */
+
+	/* V6.0: per-channel multi-config detection (back-compat ABI).
+	 * n_configs == 1 → legacy single-config, all channels share cd->config.
+	 * n_configs >= 2 → N consecutive configs after cd->config in memory,
+	 * channel ch uses config[min(ch, n_configs - 1)].
+	 */
+	int n_configs;                           /**< 1 = legacy, >=2 = per-ch */
+	size_t size_per_config;                  /**< bytes per config block */
 };
 
 struct multiband_drc_proc_fnmap {

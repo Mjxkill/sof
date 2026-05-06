@@ -43,9 +43,24 @@ DECLARE_SOF_RT_UUID("multiband_drc", multiband_drc_uuid, 0x0d9f2256, 0x8e4f, 0x4
 
 DECLARE_TR_CTX(multiband_drc_tr, SOF_UUID(multiband_drc_uuid), LOG_LEVEL_INFO);
 
+/* V6.0: helper — return per-channel config pointer.
+ * Single-config: all channels share cd->config.
+ * Multi-config: ch-th block (clamped to n_configs - 1).
+ */
+static inline struct sof_multiband_drc_config *
+mbdrc_get_config_for_ch(struct multiband_drc_comp_data *cd, int ch)
+{
+	if (cd->n_configs <= 1)
+		return cd->config;
+
+	int idx = (ch < cd->n_configs) ? ch : (cd->n_configs - 1);
+	return (struct sof_multiband_drc_config *)
+		((uint8_t *)cd->config + (size_t)idx * cd->size_per_config);
+}
+
 static void multiband_drc_reset_state(struct multiband_drc_state *state)
 {
-	int i;
+	int i, ch;
 
 	/* Reset emphasis eq-iir state */
 	for (i = 0; i < PLATFORM_MAX_CHANNELS; i++)
@@ -55,9 +70,10 @@ static void multiband_drc_reset_state(struct multiband_drc_state *state)
 	for (i = 0; i < PLATFORM_MAX_CHANNELS; i++)
 		crossover_reset_state_ch(&state->crossover[i]);
 
-	/* Reset drc kernel state */
+	/* V6.0: reset drc kernel state per [band][ch] */
 	for (i = 0; i < SOF_MULTIBAND_DRC_MAX_BANDS; i++)
-		drc_reset_state(&state->drc[i]);
+		for (ch = 0; ch < PLATFORM_MAX_CHANNELS; ch++)
+			drc_reset_state(&state->drc[i][ch]);
 
 	/* Reset deemphasis eq-iir state */
 	for (i = 0; i < PLATFORM_MAX_CHANNELS; i++)
@@ -98,12 +114,11 @@ static int multiband_drc_init_coef(struct processing_module *mod, int16_t nch, u
 {
 	struct comp_dev *dev = mod->dev;
 	struct multiband_drc_comp_data *cd = module_get_private_data(mod);
-	struct sof_eq_iir_biquad *crossover;
-	struct sof_eq_iir_biquad *emphasis;
-	struct sof_eq_iir_biquad *deemphasis;
 	struct sof_multiband_drc_config *config = cd->config;
+	struct sof_multiband_drc_config *cfg_ch;
 	struct multiband_drc_state *state = &cd->state;
 	uint32_t sample_bytes = get_sample_bytes(cd->source_format);
+	size_t size_per_config;
 	int i, ch, ret, num_bands;
 
 	if (!config) {
@@ -125,66 +140,87 @@ static int multiband_drc_init_coef(struct processing_module *mod, int16_t nch, u
 		return -EINVAL;
 	}
 
-	comp_info(dev, "multiband_drc_init_coef(), initializing %i-way crossover",
-		  config->num_bands);
+	/* V6.0: detect single-config vs multi-config (per-channel) by blob size.
+	 * size_per_config = header (up to drc_coef[]) + num_bands × drc_params.
+	 */
+	size_per_config = offsetof(struct sof_multiband_drc_config, drc_coef)
+			+ (size_t)num_bands * sizeof(struct sof_drc_params);
 
-	/* Crossover: collect the coef array and assign it to every channel */
-	crossover = config->crossover_coef;
+	if (size_per_config == 0 || config->size < size_per_config) {
+		comp_err(dev, "multiband_drc_init_coef(), invalid blob size %u (expected >= %u)",
+			 (unsigned)config->size, (unsigned)size_per_config);
+		return -EINVAL;
+	}
+	if (config->size % size_per_config != 0) {
+		comp_err(dev, "multiband_drc_init_coef(), blob size %u not multiple of cfg size %u",
+			 (unsigned)config->size, (unsigned)size_per_config);
+		return -EINVAL;
+	}
+
+	cd->size_per_config = size_per_config;
+	cd->n_configs = (int)(config->size / size_per_config);
+
+	comp_info(dev, "multiband_drc_init_coef(), %d-way crossover, n_configs=%d",
+		  config->num_bands, cd->n_configs);
+
+	/* Per-channel init: emphasis, crossover, deemphasis use cfg_ch coefs */
 	for (ch = 0; ch < nch; ch++) {
-		ret = crossover_init_coef_ch(crossover, &state->crossover[ch],
-					     config->num_bands);
-		/* Free all previously allocated blocks in case of an error */
+		cfg_ch = mbdrc_get_config_for_ch(cd, ch);
+
+		ret = crossover_init_coef_ch(cfg_ch->crossover_coef,
+					     &state->crossover[ch],
+					     cfg_ch->num_bands);
 		if (ret < 0) {
 			comp_err(dev,
-				 "multiband_drc_init_coef(), could not assign coeffs to ch %d", ch);
+				 "multiband_drc_init_coef(), crossover ch %d failed", ch);
 			goto err;
 		}
-	}
 
-	comp_info(dev, "multiband_drc_init_coef(), initializing emphasis_eq");
-
-	/* Emphasis: collect the coef array and assign it to every channel */
-	emphasis = config->emp_coef;
-	for (ch = 0; ch < nch; ch++) {
-		ret = multiband_drc_eq_init_coef_ch(emphasis, &state->emphasis[ch]);
-		/* Free all previously allocated blocks in case of an error */
+		ret = multiband_drc_eq_init_coef_ch(cfg_ch->emp_coef,
+						    &state->emphasis[ch]);
 		if (ret < 0) {
-			comp_err(dev, "multiband_drc_init_coef(), could not assign coeffs to ch %d",
-				 ch);
+			comp_err(dev,
+				 "multiband_drc_init_coef(), emphasis ch %d failed", ch);
 			goto err;
 		}
-	}
 
-	comp_info(dev, "multiband_drc_init_coef(), initializing deemphasis_eq");
-
-	/* Deemphasis: collect the coef array and assign it to every channel */
-	deemphasis = config->deemp_coef;
-	for (ch = 0; ch < nch; ch++) {
-		ret = multiband_drc_eq_init_coef_ch(deemphasis, &state->deemphasis[ch]);
-		/* Free all previously allocated blocks in case of an error */
+		ret = multiband_drc_eq_init_coef_ch(cfg_ch->deemp_coef,
+						    &state->deemphasis[ch]);
 		if (ret < 0) {
-			comp_err(dev, "multiband_drc_init_coef(), could not assign coeffs to ch %d",
-				 ch);
+			comp_err(dev,
+				 "multiband_drc_init_coef(), deemphasis ch %d failed", ch);
 			goto err;
 		}
 	}
 
-	/* Allocate all DRC pre-delay buffers and set delay time with band number */
+	/* Allocate DRC pre-delay buffers per [band][ch], mono each (nch=1).
+	 * V6.0: was state->drc[band] shared across channels — now state->drc[band][ch]
+	 * one mono drc_state per channel per band, with its own pre_delay buffer.
+	 */
 	for (i = 0; i < num_bands; i++) {
 		comp_info(dev, "multiband_drc_init_coef(), initializing drc band %d", i);
 
-		ret = drc_init_pre_delay_buffers(&state->drc[i], (size_t)sample_bytes, (int)nch);
-		if (ret < 0) {
-			comp_err(dev,
-				 "multiband_drc_init_coef(), could not init pre delay buffers");
-			goto err;
-		}
+		for (ch = 0; ch < nch; ch++) {
+			cfg_ch = mbdrc_get_config_for_ch(cd, ch);
 
-		ret = drc_set_pre_delay_time(&state->drc[i],
-					     cd->config->drc_coef[i].pre_delay_time, rate);
-		if (ret < 0) {
-			comp_err(dev, "multiband_drc_init_coef(), could not set pre delay time");
-			goto err;
+			ret = drc_init_pre_delay_buffers(&state->drc[i][ch],
+							 (size_t)sample_bytes, 1);
+			if (ret < 0) {
+				comp_err(dev,
+					 "multiband_drc_init_coef(), pre delay alloc band %d ch %d failed",
+					 i, ch);
+				goto err;
+			}
+
+			ret = drc_set_pre_delay_time(&state->drc[i][ch],
+						     cfg_ch->drc_coef[i].pre_delay_time,
+						     rate);
+			if (ret < 0) {
+				comp_err(dev,
+					 "multiband_drc_init_coef(), set pre delay band %d ch %d failed",
+					 i, ch);
+				goto err;
+			}
 		}
 	}
 
