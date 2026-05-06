@@ -210,9 +210,19 @@ int ipc_comp_dai_config(struct ipc *ipc, struct ipc_config_dai *common_config,
 	struct list_item *clist;
 	int ret = -ENODEV;
 	int i;
+	uint32_t dai_match_count = 0;
 
 	tr_info(&ipc_tr, "ipc_comp_dai_config() dai type = %d index = %d",
 		config->type, config->dai_index);
+
+	/* DIAG E6.b Phase 4: trace ipc_comp_dai_config invocations.
+	 * 0x7C8: count entries, 0x7CC: cumulative DAI match count
+	 */
+	{
+		static volatile uint32_t dbg_ipcdai_count;
+		dbg_ipcdai_count++;
+		mailbox_sw_reg_write(0x7C8, dbg_ipcdai_count);
+	}
 
 	/* for each component */
 	list_for_item(clist, &ipc->comp_list) {
@@ -230,10 +240,18 @@ int ipc_comp_dai_config(struct ipc *ipc, struct ipc_config_dai *common_config,
 		if (dev_comp_type(icd->cd) == SOF_COMP_DAI ||
 		    dev_comp_type(icd->cd) == SOF_COMP_SG_DAI) {
 
+			dai_match_count++;
 			ret = comp_dai_config(icd->cd, common_config, spec_config);
 			if (ret < 0)
 				break;
 		}
+	}
+
+	/* DIAG E6.b Phase 4: cumulative DAI matches per call (0x7CC = total since boot) */
+	{
+		static volatile uint32_t dbg_match_total;
+		dbg_match_total += dai_match_count;
+		mailbox_sw_reg_write(0x7CC, dbg_match_total);
 	}
 
 	if (ret < 0) {

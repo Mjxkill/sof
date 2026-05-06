@@ -94,9 +94,40 @@ static int pipeline_comp_copy(struct comp_dev *current,
 	struct pipeline_data *ppl_data = ctx->comp_data;
 	bool is_single_ppl = comp_is_single_pipeline(current, ppl_data->start);
 	int err;
+	uint32_t dbg_idx_p2 = 0;
 
 	pipe_dbg(current->pipeline, "pipeline_comp_copy(), current->comp.id = %u, dir = %u",
 		 dev_comp_id(current), dir);
+
+	/* DIAG E6.b: per-visit trace for PIPE 2.
+	 * 0x280 : total pipeline_comp_copy entries
+	 * 0x284 : entries on PIPE 2
+	 * 0x288 : entries on PIPE 2 reaching comp_copy (post all filters)
+	 * 0x28C : number of non-zero err returned from PIPE 2 comp_copy
+	 * 0x290-0x2EF : ring 12 first PIPE 2 visits, 8 bytes each:
+	 *   +0 : (id<<16) | (state<<8) | dir
+	 *   +4 : err (0 if filtered before comp_copy)
+	 */
+	{
+		static volatile uint32_t dbg_pcc_total;
+		static volatile uint32_t dbg_pcc_p2;
+		dbg_pcc_total++;
+		mailbox_sw_reg_write(0x280, dbg_pcc_total);
+		if (current->ipc_config.pipeline_id == 2) {
+			dbg_pcc_p2++;
+			dbg_idx_p2 = dbg_pcc_p2;
+			mailbox_sw_reg_write(0x284, dbg_idx_p2);
+			if (dbg_idx_p2 >= 1 && dbg_idx_p2 <= 12) {
+				size_t base = 0x290 + (dbg_idx_p2 - 1) * 8;
+				uint32_t info =
+					((uint32_t)current->ipc_config.id << 16) |
+					((uint32_t)current->state << 8) |
+					((uint32_t)dir & 0xff);
+				mailbox_sw_reg_write(base + 0, info);
+				mailbox_sw_reg_write(base + 4, 0u);
+			}
+		}
+	}
 
 	if (!is_single_ppl) {
 		pipe_dbg(current->pipeline,
@@ -120,19 +151,38 @@ static int pipeline_comp_copy(struct comp_dev *current,
 		return 0;
 	current->copy_seq = ppl_data->copy_seq;
 
+	/* DIAG E6.b: post-filter entry counter (PIPE 2 only) */
+	if (dbg_idx_p2) {
+		static volatile uint32_t dbg_pcc_p2_post;
+		dbg_pcc_p2_post++;
+		mailbox_sw_reg_write(0x288, dbg_pcc_p2_post);
+	}
+
 	/* copy to downstream immediately */
 	if (dir == PPL_DIR_DOWNSTREAM) {
 		err = comp_copy(current);
 		if (err < 0 || err == PPL_STATUS_PATH_STOP)
-			return err;
+			goto out;
 	}
 
 	err = pipeline_for_each_comp(current, ctx, dir);
 	if (err < 0 || err == PPL_STATUS_PATH_STOP)
-		return err;
+		goto out;
 
 	if (dir == PPL_DIR_UPSTREAM)
 		err = comp_copy(current);
+
+out:
+	/* DIAG E6.b: capture err on PIPE 2 ring */
+	if (dbg_idx_p2 >= 1 && dbg_idx_p2 <= 12) {
+		size_t base = 0x290 + (dbg_idx_p2 - 1) * 8;
+		mailbox_sw_reg_write(base + 4, (uint32_t)err);
+		if (err) {
+			static volatile uint32_t dbg_pcc_p2_err_nz;
+			dbg_pcc_p2_err_nz++;
+			mailbox_sw_reg_write(0x28C, dbg_pcc_p2_err_nz);
+		}
+	}
 
 	return err;
 }
@@ -578,6 +628,31 @@ int pipeline_trigger_run(struct pipeline *p, struct comp_dev *host, int cmd)
 		.skip_incomplete = true,
 	};
 	int ret;
+
+	/* DIAG E6.b: trace pipeline_trigger_run entry (clean zone 0x360).
+	 * 0x360 : total entries
+	 * 0x364 : last cmd
+	 * 0x368 : last pipeline_id
+	 * 0x36C : last host->ipc_config.id
+	 * 0x370-0x3AF : ring 4 first (cmd, ppl_id, host_id, host_ppl_id)
+	 */
+	{
+		static volatile uint32_t dbg_ptr;
+		uint32_t n;
+		dbg_ptr++;
+		n = dbg_ptr;
+		mailbox_sw_reg_write(0x360, n);
+		mailbox_sw_reg_write(0x364, (uint32_t)cmd);
+		mailbox_sw_reg_write(0x368, (uint32_t)p->pipeline_id);
+		mailbox_sw_reg_write(0x36C, host ? (uint32_t)host->ipc_config.id : 0xFFFFFFFFu);
+		if (n >= 1 && n <= 4) {
+			size_t base = 0x370 + (n - 1) * 16;
+			mailbox_sw_reg_write(base + 0, (uint32_t)cmd);
+			mailbox_sw_reg_write(base + 4, (uint32_t)p->pipeline_id);
+			mailbox_sw_reg_write(base + 8, host ? (uint32_t)host->ipc_config.id : 0xFFFFFFFFu);
+			mailbox_sw_reg_write(base + 12, host ? (uint32_t)host->ipc_config.pipeline_id : 0xFFFFFFFFu);
+		}
+	}
 
 	pipe_dbg(p, "execute trigger cmd %d on pipe %u", cmd, p->pipeline_id);
 

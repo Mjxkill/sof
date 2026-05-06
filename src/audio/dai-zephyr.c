@@ -10,7 +10,6 @@
 #include <sof/audio/format.h>
 #include <sof/audio/pipeline.h>
 #include <sof/common.h>
-#include <sof/lib/mailbox.h>
 #include <rtos/panic.h>
 #include <sof/ipc/msg.h>
 #include <rtos/interrupt.h>
@@ -246,28 +245,6 @@ dai_dma_cb(struct dai_data *dd, struct comp_dev *dev, uint32_t bytes,
 {
 	enum dma_cb_status dma_status = DMA_CB_STATUS_RELOAD;
 	int ret;
-
-	/* DIAG E6.b: count DMA callbacks per direction. REMOVE after diag.
-	 * Local counter, mailbox publish every 256 cb (~500ms) only.
-	 * 0x308: dma_cb playback count, 0x30C: dma_cb capture count
-	 * 0x310: last bytes (play), 0x314: last state (play)
-	 */
-	{
-		static volatile uint32_t dbg_dma_cb_play_count;
-		static volatile uint32_t dbg_dma_cb_cap_count;
-		if (dev->direction == SOF_IPC_STREAM_PLAYBACK) {
-			dbg_dma_cb_play_count++;
-			if ((dbg_dma_cb_play_count & 0x0F) == 1) {
-				mailbox_sw_reg_write(0x308, dbg_dma_cb_play_count);
-				mailbox_sw_reg_write(0x310, bytes);
-				mailbox_sw_reg_write(0x314, dev->state);
-			}
-		} else {
-			dbg_dma_cb_cap_count++;
-			if ((dbg_dma_cb_cap_count & 0x0F) == 1)
-				mailbox_sw_reg_write(0x30C, dbg_dma_cb_cap_count);
-		}
-	}
 
 	comp_dbg(dev, "dai_dma_cb()");
 
@@ -1509,24 +1486,6 @@ int dai_common_copy(struct dai_data *dd, struct comp_dev *dev, pcm_converter_fun
 	uint32_t sink_samples;
 	uint32_t samples = UINT32_MAX;
 	int ret;
-
-	/* DIAG E6.b: count DAI copy invocations per direction. REMOVE after diag.
-	 * Local counter, mailbox publish every 256 ticks (~500ms) only.
-	 * 0x300: DAI playback count, 0x304: DAI capture count
-	 */
-	{
-		static volatile uint32_t dbg_dai_play_count;
-		static volatile uint32_t dbg_dai_cap_count;
-		if (dev->direction == SOF_IPC_STREAM_PLAYBACK) {
-			dbg_dai_play_count++;
-			if ((dbg_dai_play_count & 0x0F) == 1)
-				mailbox_sw_reg_write(0x300, dbg_dai_play_count);
-		} else {
-			dbg_dai_cap_count++;
-			if ((dbg_dai_cap_count & 0x0F) == 1)
-				mailbox_sw_reg_write(0x304, dbg_dai_cap_count);
-		}
-	}
 
 	/* get data sizes from DMA */
 	ret = dma_get_status(dd->chan->dma->z_dev, dd->chan->index, &stat);

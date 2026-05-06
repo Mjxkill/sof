@@ -43,7 +43,6 @@ DECLARE_TR_CTX(matrix_2x8_tr, SOF_UUID(matrix_2x8_uuid), LOG_LEVEL_INFO);
 struct matrix_2x8_runtime {
 	struct matrix_2x8_gains gains;
 	struct comp_data_blob_handler *blob_handler;
-	unsigned int dbg_count;	/* DIAG E6.b: log first ticks */
 };
 
 static void matrix_2x8_set_identity(struct matrix_2x8_gains *g)
@@ -146,20 +145,19 @@ static int matrix_2x8_get_config(struct processing_module *mod,
 }
 
 /*
- * Process loop — AUDIO_STREAM mode (V5.4.1 E6.b iter7).
+ * Process loop — OUTPUT-DRIVEN (V5.4.1 E6.b final).
  *
- * The matrix_2x8 component now uses the AUDIO_STREAM dispatch path
- * (module_adapter_audio_stream_type_copy) instead of SOURCE_SINK. The
- * framework calls module_single_sink_setup which computes input_buffers[s].size
- * via audio_stream_avail_frames_aligned for each source — this is the same
- * path used by eq/drc/pga and properly handles TDM 8-slot frame alignment.
+ * Cahier des charges :
+ *   - Cadence dictée UNIQUEMENT par le sink (audio_stream_get_free_frames).
+ *   - Aucune dépendance à l'état des sources (active/inactive/préparée).
+ *   - Sources vides ou partielles → contribution silencieuse implicite
+ *     (gain * 0 = 0 dans la boucle de mix via la garde frame < src_avail).
+ *   - Aucun bail-out précoce sur les entrées : si toutes vides, le mix
+ *     accumule 0 et on écrit du silence dans le sink.
  *
- * For each frame, each output channel j is the Q1.31-weighted sum of the 16
- * input channels (8 from src 0 + 8 from src 1). audio_stream_read/write_frag_s32
- * gives wrap-safe access to circular buffers (no manual wrap handling needed).
- *
- * Sources with input_buffers[s].size < min_frames contribute silence for the
- * frames beyond their available count (mix loop skip).
+ * Justification de sûreté : RX et TX SAI7 synchrones (même BCLK), donc pas
+ * d'underrun possible côté DSP. Le PCM host alimente toujours B0. B5
+ * cross-pipeline peut être vide → contribution silencieuse sur la voie mics.
  */
 static int matrix_2x8_process(struct processing_module *mod,
 			      struct input_stream_buffer *input_buffers, int num_input_buffers,
@@ -168,13 +166,46 @@ static int matrix_2x8_process(struct processing_module *mod,
 	struct matrix_2x8_runtime *rt = module_get_private_data(mod);
 	struct audio_stream *src_stream[MATRIX_2X8_MAX_SOURCES];
 	struct audio_stream *sink_stream;
-	uint32_t src_frames[MATRIX_2X8_MAX_SOURCES];
-	uint32_t min_frames = UINT32_MAX;
+	uint32_t src_avail[MATRIX_2X8_MAX_SOURCES];
+	uint32_t nb_frames;
+	uint32_t sink_frame_bytes;
 	int32_t (*gain)[MATRIX_2X8_OUT_CHANNELS];
 	int s, i, j;
 	uint32_t frame;
 	int32_t sample;
 	int64_t acc;
+
+	/* DIAG E6.b: instrumentation AVANT les gardes — chaque appel compte.
+	 * 0x150 : dbg_total (compteur appels totaux, incrémenté à chaque entrée)
+	 * 0x154 : num_input_buffers (vu par matrix_2x8_process)
+	 * 0x158 : num_output_buffers (forcé à 0 par module_adapter si sink->state != dev->state)
+	 * 0x15C : mod->dev->state (état matrix_2x8 lui-même)
+	 * 0x160 : downstream sink->state (consommateur de B100, normalement interleave_8)
+	 * 0x164 : num bsink connectés (sanity check liste)
+	 */
+	{
+		static volatile uint32_t dbg_total;
+		dbg_total++;
+		if ((dbg_total & 0x1F) == 1) {
+			struct list_item *blist;
+			struct comp_buffer *cb;
+			uint32_t sink_state = 0xFFFFFFFFu;
+			uint32_t bsink_count = 0;
+
+			list_for_item(blist, &mod->dev->bsink_list) {
+				cb = container_of(blist, struct comp_buffer, source_list);
+				bsink_count++;
+				if (cb->sink && sink_state == 0xFFFFFFFFu)
+					sink_state = cb->sink->state;
+			}
+			mailbox_sw_reg_write(0x150, dbg_total);
+			mailbox_sw_reg_write(0x154, (uint32_t)num_input_buffers);
+			mailbox_sw_reg_write(0x158, (uint32_t)num_output_buffers);
+			mailbox_sw_reg_write(0x15C, mod->dev->state);
+			mailbox_sw_reg_write(0x160, sink_state);
+			mailbox_sw_reg_write(0x164, bsink_count);
+		}
+	}
 
 	/* Refresh gains if a new blob was uploaded */
 	if (comp_is_new_data_blob_available(rt->blob_handler)) {
@@ -186,116 +217,71 @@ static int matrix_2x8_process(struct processing_module *mod,
 	gain = rt->gains.gain;
 
 	if (num_input_buffers <= 0 || num_input_buffers > MATRIX_2X8_MAX_SOURCES)
-		return -EINVAL;
+		return 0;
 	if (num_output_buffers != MATRIX_2X8_MAX_SINKS)
-		return -EINVAL;
-
-	/* DIAG E6.b: minimal mailbox writes. Local counter, snapshots only at
-	 * specific ticks (1, 5, 10, 100, 500, 1000). Live counter republished
-	 * every 256 ticks (~500ms) only. REMOVE after diag.
-	 *
-	 * Mailbox layout:
-	 *   0x100: magic 0xDEADBEEF
-	 *   0x104: live tick counter (refreshed every 256 ticks)
-	 *   0x108: number of snapshots stored
-	 *   0x110-0x14F: slot 0 (tick=1)    +0x40 each slot
-	 *   0x150-0x18F: slot 1 (tick=5)
-	 *   0x190-0x1CF: slot 2 (tick=10)
-	 *   0x1D0-0x20F: slot 3 (tick=100)
-	 *   0x210-0x24F: slot 4 (tick=500)
-	 *   0x250-0x28F: slot 5 (tick=1000)
-	 */
-	rt->dbg_count++;
-
-	/* Periodic live publish: every 16 ticks (~32ms) — limit SRAM writes */
-	if ((rt->dbg_count & 0x0F) == 1) {
-		mailbox_sw_reg_write(0x100, 0xDEADBEEF);
-		mailbox_sw_reg_write(0x104, rt->dbg_count);
-	}
-
-	{
-		uint32_t slot_off = 0;
-		switch (rt->dbg_count) {
-		case 1:    slot_off = 0x110; break;
-		case 5:    slot_off = 0x150; break;
-		case 10:   slot_off = 0x190; break;
-		case 100:  slot_off = 0x1D0; break;
-		case 500:  slot_off = 0x210; break;
-		case 1000: slot_off = 0x250; break;
-		default:   slot_off = 0; break;
-		}
-		if (slot_off) {
-			struct comp_buffer *cb0 = NULL, *cb1 = NULL;
-
-			mailbox_sw_reg_write(slot_off + 0x00, rt->dbg_count);
-			mailbox_sw_reg_write(slot_off + 0x04, num_input_buffers);
-			if (num_input_buffers >= 1) {
-				cb0 = container_of(input_buffers[0].data,
-						   struct comp_buffer, stream);
-				mailbox_sw_reg_write(slot_off + 0x08,
-					input_buffers[0].size);
-				mailbox_sw_reg_write(slot_off + 0x0C,
-					audio_stream_get_avail_bytes(input_buffers[0].data));
-				mailbox_sw_reg_write(slot_off + 0x10,
-					audio_stream_frame_bytes(input_buffers[0].data));
-				mailbox_sw_reg_write(slot_off + 0x14,
-					audio_stream_get_channels(input_buffers[0].data));
-				mailbox_sw_reg_write(slot_off + 0x18,
-					cb0->source ? cb0->source->state : 0xFFFFFFFF);
-			}
-			if (num_input_buffers >= 2) {
-				cb1 = container_of(input_buffers[1].data,
-						   struct comp_buffer, stream);
-				mailbox_sw_reg_write(slot_off + 0x1C,
-					input_buffers[1].size);
-				mailbox_sw_reg_write(slot_off + 0x20,
-					audio_stream_get_avail_bytes(input_buffers[1].data));
-				mailbox_sw_reg_write(slot_off + 0x24,
-					audio_stream_frame_bytes(input_buffers[1].data));
-				mailbox_sw_reg_write(slot_off + 0x28,
-					audio_stream_get_channels(input_buffers[1].data));
-				mailbox_sw_reg_write(slot_off + 0x2C,
-					cb1->source ? cb1->source->state : 0xFFFFFFFF);
-			}
-			mailbox_sw_reg_write(slot_off + 0x30,
-				audio_stream_get_free_bytes(output_buffers[0].data));
-			mailbox_sw_reg_write(slot_off + 0x34,
-				audio_stream_frame_bytes(output_buffers[0].data));
-			mailbox_sw_reg_write(slot_off + 0x38,
-				audio_stream_get_channels(output_buffers[0].data));
-			mailbox_sw_reg_write(0x108,
-				(rt->dbg_count >= 1000) ? 6 :
-				(rt->dbg_count >= 500) ? 5 :
-				(rt->dbg_count >= 100) ? 4 :
-				(rt->dbg_count >= 10) ? 3 :
-				(rt->dbg_count >= 5) ? 2 : 1);
-		}
-	}
-
-	/* RESET — minimal mixer logic. Pure MIN over sources, mix loop, commit.
-	 * No iter1/4/6/8/9/10 patches. Naive reference state to study real bug.
-	 */
-	sink_stream = output_buffers[0].data;
-	for (s = 0; s < num_input_buffers; s++) {
-		src_stream[s] = input_buffers[s].data;
-		src_frames[s] = input_buffers[s].size;
-		if (src_frames[s] < min_frames)
-			min_frames = src_frames[s];
-	}
-
-	if (min_frames == 0 || min_frames == UINT32_MAX)
 		return 0;
 
-	/* Mix loop. audio_stream_read/write_frag_s32 handle wrap automatically.
-	 * Sources whose src_frames[s] < frame contribute silence implicitly via
-	 * skip — their gain contribution is 0 for those frames.
+	/* DIAG E6.b: matrix process tick counter (throttled 1/16) */
+	{
+		static volatile uint32_t dbg_count;
+		dbg_count++;
+		if ((dbg_count & 0x0F) == 1) {
+			mailbox_sw_reg_write(0x100, 0xDEADBEEF);
+			mailbox_sw_reg_write(0x104, dbg_count);
+		}
+	}
+
+	sink_stream = output_buffers[0].data;
+	sink_frame_bytes = audio_stream_frame_bytes(sink_stream);
+
+	/* DIAG E6.b: dump B100 (sink) state at every 16th tick to verify init.
+	 * 0x130 : sink_frame_bytes (should be 32 = 4 bytes/sample × 8 ch)
+	 * 0x134 : sink free_bytes
+	 * 0x138 : sink free_frames (= free_bytes / frame_bytes, undefined if frame_bytes=0)
+	 * 0x13C : sink channels (should be 8)
+	 * 0x140 : sink frame_fmt (should be SOF_IPC_FRAME_S32_LE = 2)
 	 */
-	for (frame = 0; frame < min_frames; frame++) {
+	{
+		static volatile uint32_t dbg_sink;
+		dbg_sink++;
+		if ((dbg_sink & 0x0F) == 1) {
+			mailbox_sw_reg_write(0x130, sink_frame_bytes);
+			mailbox_sw_reg_write(0x134, audio_stream_get_free_bytes(sink_stream));
+			mailbox_sw_reg_write(0x138, sink_frame_bytes ?
+				audio_stream_get_free_bytes(sink_stream) / sink_frame_bytes : 0xFFFFFFFFu);
+			mailbox_sw_reg_write(0x13C, audio_stream_get_channels(sink_stream));
+			mailbox_sw_reg_write(0x140, audio_stream_get_frm_fmt(sink_stream));
+		}
+	}
+
+	if (!sink_frame_bytes)
+		return 0;
+
+	/* Cadence : sink seul. Borné par period pour rester dans le tick. */
+	nb_frames = audio_stream_get_free_frames(sink_stream);
+	if (nb_frames > MATRIX_2X8_PERIOD_FRAMES)
+		nb_frames = MATRIX_2X8_PERIOD_FRAMES;
+	if (!nb_frames)
+		return 0;
+
+	/* Snapshot des frames disponibles par source. Lecture du size posé
+	 * par module_single_sink_setup via audio_stream_avail_frames_aligned.
+	 * Aucune lecture d'état comp source — juste le compteur d'octets dispo.
+	 */
+	for (s = 0; s < num_input_buffers; s++) {
+		src_stream[s] = input_buffers[s].data;
+		src_avail[s] = input_buffers[s].size;
+	}
+
+	/* Mix loop output-driven. Si frame >= src_avail[s], la source contribue
+	 * 0 (silence implicite). Pas de bail-out, on produit toujours nb_frames.
+	 */
+	for (frame = 0; frame < nb_frames; frame++) {
 		for (j = 0; j < MATRIX_2X8_OUT_CHANNELS; j++) {
 			acc = 0;
 			for (s = 0; s < num_input_buffers; s++) {
-				if (frame >= src_frames[s])
-					continue;
+				if (frame >= src_avail[s])
+					continue; /* contribution silencieuse */
 				for (i = 0; i < MATRIX_2X8_OUT_CHANNELS; i++) {
 					int32_t *src_ptr = audio_stream_read_frag_s32(
 						src_stream[s],
@@ -319,16 +305,34 @@ static int matrix_2x8_process(struct processing_module *mod,
 		}
 	}
 
-	/* Inform framework: produced and consumed bytes.
-	 * output_buffers[0].size is in BYTES. input_buffers[s].consumed is in BYTES.
+	/* Produced : toujours nb_frames complets vers le sink. */
+	output_buffers[0].size = nb_frames * sink_frame_bytes;
+
+	/* Consumed par source : MIN(src_avail, nb_frames). consumed=0 si vide,
+	 * le framework skippe l'appel audio_stream_consume sans corrompre.
 	 */
-	output_buffers[0].size = audio_stream_frame_bytes(sink_stream) * min_frames;
 	for (s = 0; s < num_input_buffers; s++) {
-		uint32_t consumed = (src_frames[s] < min_frames) ? src_frames[s] : min_frames;
-		input_buffers[s].consumed = audio_stream_frame_bytes(src_stream[s]) * consumed;
+		uint32_t consumed = (src_avail[s] < nb_frames) ? src_avail[s] : nb_frames;
+		input_buffers[s].consumed = consumed *
+			audio_stream_frame_bytes(src_stream[s]);
 	}
 
 	return 0;
+}
+
+/*
+ * Trigger LOCAL — V5.4.1 E6.b final.
+ *
+ * Bypass délibéré de module_adapter_set_state() (branche num_of_sources > 1
+ * qui couple le trigger à l'état des sources via module_source_status_count).
+ *
+ * Sémantique table de mixage : matrix_2x8 s'allume/s'éteint UNIQUEMENT sur
+ * son propre cycle de trigger. L'état de ses entrées n'a aucune incidence
+ * sur sa transition d'état.
+ */
+static int matrix_2x8_trigger(struct processing_module *mod, int cmd)
+{
+	return comp_set_state(mod->dev, cmd);
 }
 
 static int matrix_2x8_reset(struct processing_module *mod)
@@ -356,6 +360,7 @@ static const struct module_interface matrix_2x8_interface = {
 	.process_audio_stream = matrix_2x8_process,
 	.set_configuration = matrix_2x8_set_config,
 	.get_configuration = matrix_2x8_get_config,
+	.trigger = matrix_2x8_trigger,
 	.reset = matrix_2x8_reset,
 	.free = matrix_2x8_free,
 };

@@ -232,6 +232,29 @@ void host_common_update(struct host_data *hd, struct comp_dev *dev, uint32_t byt
 	bool update_mailbox = false;
 	bool send_ipc = false;
 
+	/* DIAG E6.b: trace host_common_update entries (clean 0x410-0x42F).
+	 * 0x410 : total entries
+	 * 0x414 : last direction
+	 * 0x418 : last bytes
+	 * 0x41C : hd->local_pos AVANT increment
+	 * 0x420 : hd->report_pos AVANT increment
+	 * 0x424 : hd->host_period_bytes
+	 * 0x428 : hd->host_size
+	 * 0x42C : hd->no_stream_position flag
+	 */
+	{
+		static volatile uint32_t dbg_hcu;
+		dbg_hcu++;
+		mailbox_sw_reg_write(0x410, dbg_hcu);
+		mailbox_sw_reg_write(0x414, (uint32_t)dev->direction);
+		mailbox_sw_reg_write(0x418, bytes);
+		mailbox_sw_reg_write(0x41C, (uint32_t)hd->local_pos);
+		mailbox_sw_reg_write(0x420, (uint32_t)hd->report_pos);
+		mailbox_sw_reg_write(0x424, (uint32_t)hd->host_period_bytes);
+		mailbox_sw_reg_write(0x428, (uint32_t)hd->host_size);
+		mailbox_sw_reg_write(0x42C, (uint32_t)hd->no_stream_position);
+	}
+
 	if (dev->direction == SOF_IPC_STREAM_PLAYBACK) {
 		source = hd->dma_buffer;
 		sink = hd->local_buffer;
@@ -345,6 +368,36 @@ static void host_dma_cb(void *arg, enum notify_id type, void *data)
 	struct comp_dev *dev = arg;
 	struct host_data *hd = comp_get_drvdata(dev);
 	uint32_t bytes = next->elem.size;
+
+	/* DIAG E6.b: trace host_dma_cb entries (clean 0x400-0x46F).
+	 * 0x400 : total entries
+	 * 0x404 : PLAY entries
+	 * 0x408 : CAP entries
+	 * 0x40C : last bytes
+	 * 0x430-0x46F : ring 8 first (id, pipeline_id) — 8 B each
+	 */
+	{
+		static volatile uint32_t dbg_total, dbg_play, dbg_cap;
+		uint32_t n;
+		dbg_total++;
+		n = dbg_total;
+		mailbox_sw_reg_write(0x400, n);
+		mailbox_sw_reg_write(0x40C, bytes);
+		if (dev->direction == SOF_IPC_STREAM_PLAYBACK) {
+			dbg_play++;
+			mailbox_sw_reg_write(0x404, dbg_play);
+		} else {
+			dbg_cap++;
+			mailbox_sw_reg_write(0x408, dbg_cap);
+		}
+		if (n >= 1 && n <= 8) {
+			size_t base = 0x430 + (n - 1) * 8;
+			mailbox_sw_reg_write(base + 0,
+				(uint32_t)dev->ipc_config.id);
+			mailbox_sw_reg_write(base + 4,
+				(uint32_t)dev->ipc_config.pipeline_id);
+		}
+	}
 
 	comp_dbg(dev, "host_dma_cb() %p", &comp_host);
 

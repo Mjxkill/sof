@@ -12,6 +12,7 @@
 #include <rtos/alloc.h>
 #include <sof/lib/dma.h>
 #include <sof/lib/io.h>
+#include <sof/lib/mailbox.h>
 #include <sof/lib/notifier.h>
 #include <sof/lib/uuid.h>
 #include <rtos/wait.h>
@@ -106,6 +107,22 @@ static void sdma_enable_channel(struct dma *dma, int channel)
 
 static void sdma_disable_channel(struct dma *dma, int channel)
 {
+	/* DIAG E6.b: trace ALL sdma_disable_channel calls (clean zone 0x300).
+	 * 0x300 : total entries
+	 * 0x304 : last chan disabled
+	 * 0x310-0x31F : ring 4 first chan disabled
+	 */
+	{
+		static volatile uint32_t dbg_dis;
+		uint32_t n;
+		dbg_dis++;
+		n = dbg_dis;
+		mailbox_sw_reg_write(0x300, n);
+		mailbox_sw_reg_write(0x304, (uint32_t)channel);
+		if (n >= 1 && n <= 4)
+			mailbox_sw_reg_write(0x310 + (n - 1) * 4,
+					     (uint32_t)channel);
+	}
 	dma_reg_write(dma, SDMA_STOP_STAT, BIT(channel));
 }
 
@@ -419,6 +436,11 @@ static struct dma_chan_data *sdma_channel_get(struct dma *dma,
 	/* Ignoring channel 0; let's just allocate a free channel */
 
 	tr_dbg(&sdma_tr, "sdma_channel_get");
+	{
+		static volatile uint32_t dbg_get_count;
+		dbg_get_count++;
+		mailbox_sw_reg_write(0x7E0, dbg_get_count);
+	}
 	for (i = 1; i < dma->plat_data.channels; i++) {
 		channel = &dma->chan[i];
 		if (channel->status != COMP_STATE_INIT)
@@ -437,6 +459,9 @@ static struct dma_chan_data *sdma_channel_get(struct dma *dma,
 
 		/* Allow events, allow manual */
 		sdma_set_overrides(channel, false, false);
+		/* DIAG E6.b Phase 4: log last allocated chan_index + status before alloc */
+		mailbox_sw_reg_write(0x7E4, (uint32_t)i);
+		mailbox_sw_reg_write(0x7E8, (uint32_t)channel->status);
 		return channel;
 	}
 	tr_err(&sdma_tr, "sdma no channel free");
@@ -482,6 +507,14 @@ static void sdma_channel_put(struct dma_chan_data *channel)
 		return; /* Channel was already free */
 	tr_dbg(&sdma_tr, "sdma_channel_put(%d)", channel->index);
 
+	/* DIAG E6.b Phase 4: trace channel release (alloc/release sequence) */
+	{
+		static volatile uint32_t dbg_put_count;
+		dbg_put_count++;
+		mailbox_sw_reg_write(0x7F0, dbg_put_count);
+		mailbox_sw_reg_write(0x7F4, (uint32_t)channel->index);
+	}
+
 	dma_interrupt_legacy(channel, DMA_IRQ_CLEAR);
 	sdma_disable_event(channel, pdata->hw_event);
 	sdma_set_overrides(channel, false, false);
@@ -493,6 +526,29 @@ static int sdma_start(struct dma_chan_data *channel)
 	struct sdma_chan *pdata = dma_chan_get_data(channel);
 
 	tr_dbg(&sdma_tr, "sdma_start(%d)", channel->index);
+
+	/* DIAG E6.b: count sdma_start entry + last channel index.
+	 * 0x5A0: total entry, 0x5A4: last channel index, 0x5A8: last status
+	 * 0x5B0: HSTART commit count, 0x5B4: last HSTART channel index
+	 * 0x6B0-0x6CC: per-channel sdma_start counter (chan 0..7)
+	 * 0x6D0: last sdma_chan_type at sdma_start
+	 * 0x6D4: last hw_event at sdma_start
+	 */
+	{
+		static volatile uint32_t dbg_entry;
+		static volatile uint32_t dbg_chan_start[8];
+		dbg_entry++;
+		mailbox_sw_reg_write(0x5A0, dbg_entry);
+		mailbox_sw_reg_write(0x5A4, channel->index);
+		mailbox_sw_reg_write(0x5A8, channel->status);
+		if (channel->index < 8) {
+			dbg_chan_start[channel->index]++;
+			mailbox_sw_reg_write(0x6B0 + channel->index * 4,
+					     dbg_chan_start[channel->index]);
+		}
+		mailbox_sw_reg_write(0x6D0, (uint32_t)pdata->sdma_chan_type);
+		mailbox_sw_reg_write(0x6D4, (uint32_t)pdata->hw_event);
+	}
 
 	if (channel->status != COMP_STATE_PREPARE &&
 	    channel->status != COMP_STATE_PAUSED)
@@ -514,17 +570,46 @@ static int sdma_start(struct dma_chan_data *channel)
 	 * The old dummy_dma_start was a no-op; we preserve that semantic
 	 * for AP2AP.
 	 */
-	if (pdata->sdma_chan_type != SDMA_CHAN_TYPE_AP2AP)
+	if (pdata->sdma_chan_type != SDMA_CHAN_TYPE_AP2AP) {
+		static volatile uint32_t dbg_hstart;
+		dbg_hstart++;
+		mailbox_sw_reg_write(0x5B0, dbg_hstart);
+		mailbox_sw_reg_write(0x5B4, channel->index);
 		sdma_enable_channel(channel->dma, channel->index);
+	}
 
 	return 0;
 }
 
 static int sdma_stop(struct dma_chan_data *channel)
 {
+	/* DIAG E6.b: trace sdma_stop entry (BEFORE early-return guard).
+	 * 0x320 : total entries (every call, regardless of status)
+	 * 0x324 : last chan->index seen
+	 * 0x328 : last chan->status seen on entry
+	 * 0x330-0x33F : ring 4 first chan->index
+	 * 0x32C : count of EARLY-RETURNS (status != ACTIVE && != PAUSED)
+	 */
+	{
+		static volatile uint32_t dbg_stop;
+		uint32_t n;
+		dbg_stop++;
+		n = dbg_stop;
+		mailbox_sw_reg_write(0x320, n);
+		mailbox_sw_reg_write(0x324, (uint32_t)channel->index);
+		mailbox_sw_reg_write(0x328, (uint32_t)channel->status);
+		if (n >= 1 && n <= 4)
+			mailbox_sw_reg_write(0x330 + (n - 1) * 4,
+					     (uint32_t)channel->index);
+	}
+
 	if (channel->status != COMP_STATE_ACTIVE &&
-	    channel->status != COMP_STATE_PAUSED)
+	    channel->status != COMP_STATE_PAUSED) {
+		static volatile uint32_t dbg_stop_skip;
+		dbg_stop_skip++;
+		mailbox_sw_reg_write(0x32C, dbg_stop_skip);
 		return 0;
+	}
 
 	channel->status = COMP_STATE_READY;
 
@@ -574,6 +659,34 @@ static int sdma_copy(struct dma_chan_data *channel, int bytes, uint32_t flags)
 	};
 
 	tr_dbg(&sdma_tr, "sdma_copy");
+
+	/* DIAG E6.b: count sdma_copy entry (BD reload) per channel.
+	 * 0x600: total entry, 0x604: last channel index, 0x608: last bytes
+	 * 0x60C: per-channel count for chan 6 (SAI TX), throttled 1/16
+	 * 0x680-0x69C: per-channel sdma_copy counter (chan 0..7) — full count
+	 * 0x6A0: last sdma_chan_type seen for chan 3 (probable SAI TX)
+	 */
+	{
+		static volatile uint32_t dbg_entry, dbg_chan6;
+		static volatile uint32_t dbg_chan_copy[8];
+		dbg_entry++;
+		if ((dbg_entry & 0x0F) == 1) {
+			mailbox_sw_reg_write(0x600, dbg_entry);
+			mailbox_sw_reg_write(0x604, channel->index);
+			mailbox_sw_reg_write(0x608, (uint32_t)bytes);
+		}
+		if (channel->index == 6) {
+			dbg_chan6++;
+			mailbox_sw_reg_write(0x60C, dbg_chan6);
+		}
+		if (channel->index < 8) {
+			dbg_chan_copy[channel->index]++;
+			mailbox_sw_reg_write(0x680 + channel->index * 4,
+					     dbg_chan_copy[channel->index]);
+		}
+		if (channel->index == 3)
+			mailbox_sw_reg_write(0x6A0, (uint32_t)pdata->sdma_chan_type);
+	}
 
 	if (pdata->sdma_chan_type == SDMA_CHAN_TYPE_AP2AP) {
 		/* Delegate AP2AP to the single memcpy_dma primitive so every
@@ -975,6 +1088,46 @@ static int sdma_set_config(struct dma_chan_data *channel,
 
 	tr_dbg(&sdma_tr, "sdma_set_config channel %d", channel->index);
 
+	/* DIAG E6.b: log config for chan 6 (SAI TX). Once-only.
+	 * 0x630: chan 6 entry magic 0xC06FA1C0
+	 * 0x634: cyclic flag, 0x638: irq_disabled flag, 0x63C: elem count
+	 * 0x640: chan_type (AP2AP=2 etc), 0x644: direction
+	 * 0x648: src_width, 0x64C: dest_width
+	 * 0x650: first BD config (after sdma_prep_desc)
+	 * 0x654: last BD config (after sdma_prep_desc)
+	 */
+	if (channel->index == 6) {
+		mailbox_sw_reg_write(0x630, 0xC06FA1C0);
+		mailbox_sw_reg_write(0x634, (uint32_t)config->cyclic);
+		mailbox_sw_reg_write(0x638, (uint32_t)config->irq_disabled);
+		mailbox_sw_reg_write(0x63C, (uint32_t)config->elem_array.count);
+		mailbox_sw_reg_write(0x640, (uint32_t)pdata->sdma_chan_type);
+		mailbox_sw_reg_write(0x644, (uint32_t)config->direction);
+		mailbox_sw_reg_write(0x648, (uint32_t)config->src_width);
+		mailbox_sw_reg_write(0x64C, (uint32_t)config->dest_width);
+	}
+
+	/* DIAG E6.b ph2: per-channel set_config trace.
+	 * 0x780-0x79C : per-chan set_config counter (chan 0..7)
+	 * 0x7A0-0x7BC : per-chan last direction
+	 * 0x7C0       : last (chan_idx << 8) | direction at any set_config
+	 */
+	{
+		static volatile uint32_t dbg_setcfg[8];
+		static volatile uint32_t dbg_dir[8];
+		if (channel->index < 8) {
+			dbg_setcfg[channel->index]++;
+			dbg_dir[channel->index] = (uint32_t)config->direction;
+			mailbox_sw_reg_write(0x780 + channel->index * 4,
+					     dbg_setcfg[channel->index]);
+			mailbox_sw_reg_write(0x7A0 + channel->index * 4,
+					     dbg_dir[channel->index]);
+		}
+		mailbox_sw_reg_write(0x7C0,
+				     ((uint32_t)channel->index << 8) |
+				     ((uint32_t)config->direction & 0xff));
+	}
+
 	ret = sdma_read_config(channel, config);
 	if (ret < 0)
 		return ret;
@@ -985,6 +1138,13 @@ static int sdma_set_config(struct dma_chan_data *channel,
 	ret = sdma_prep_desc(channel, config);
 	if (ret < 0)
 		return ret;
+
+	/* DIAG E6.b: read first/last BD config after prep_desc for chan 6 */
+	if (channel->index == 6 && pdata->desc_count > 0) {
+		mailbox_sw_reg_write(0x650, (uint32_t)pdata->desc[0].config);
+		mailbox_sw_reg_write(0x654,
+			(uint32_t)pdata->desc[pdata->desc_count - 1].config);
+	}
 
 	/* AP2AP is software-triggered (no HW event). The SDMA runnability
 	 * formula (TRM §7.2) requires (event_pending OR EVTOVR) to be true.

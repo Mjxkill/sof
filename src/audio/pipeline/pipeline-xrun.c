@@ -76,6 +76,12 @@ int pipeline_xrun_recover(struct pipeline *p)
 	/* reset xrun status as we already in prepared */
 	p->xrun_bytes = 0;
 
+	/* DIAG E6.b: count xrun_recover trigger START (clean 0x3C8) */
+	{
+		static volatile uint32_t dbg_xrun_recover;
+		dbg_xrun_recover++;
+		mailbox_sw_reg_write(0x3C8, dbg_xrun_recover);
+	}
 	/* restart pipeline comps */
 	ret = pipeline_trigger(p, p->source_comp, COMP_TRIGGER_START);
 	if (ret < 0) {
@@ -156,6 +162,12 @@ void pipeline_xrun(struct pipeline *p, struct comp_dev *dev,
 	if (dev->state != COMP_STATE_ACTIVE)
 		return;
 
+	/* DIAG E6.b: count pipeline_xrun XRUN trigger (clean 0x3CC) */
+	{
+		static volatile uint32_t dbg_xrun_trig;
+		dbg_xrun_trig++;
+		mailbox_sw_reg_write(0x3CC, dbg_xrun_trig);
+	}
 	/* notify all pipeline comps we are in XRUN, and stop copying */
 	ret = pipeline_trigger(p, p->source_comp, COMP_TRIGGER_XRUN);
 	if (ret < 0)

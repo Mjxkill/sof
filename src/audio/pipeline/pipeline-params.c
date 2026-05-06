@@ -8,6 +8,7 @@
 #include <sof/audio/buffer.h>
 #include <sof/audio/component_ext.h>
 #include <sof/audio/pipeline.h>
+#include <sof/lib/mailbox.h>
 #include <sof/lib/memory.h>
 #include <sof/lib/mm_heap.h>
 #include <sof/compiler_attributes.h>
@@ -34,6 +35,26 @@ static int pipeline_comp_params_neg(struct comp_dev *current,
 
 	pipe_dbg(current->pipeline, "pipeline_comp_params_neg(), current->comp.id = 0x%x, dir = %u",
 		 dev_comp_id(current), dir);
+
+	/* DIAG E6.b Phase 4: trace pipeline_comp_params_neg cross-pipeline traversal.
+	 * 0x738: counter entry, 0x73C: current->pipeline_id, 0x740: start->pipeline_id
+	 * 0x744: current->state, 0x748: cross-pipeline hits counter
+	 */
+	{
+		static volatile uint32_t dbg_neg_count, dbg_neg_xpipe;
+		uint32_t cur_pid = current->pipeline ? current->pipeline->pipeline_id : 0xFFFFFFFFu;
+		uint32_t start_pid = ppl_data->start && ppl_data->start->pipeline ?
+				     ppl_data->start->pipeline->pipeline_id : 0xFFFFFFFFu;
+		dbg_neg_count++;
+		mailbox_sw_reg_write(0x738, dbg_neg_count);
+		mailbox_sw_reg_write(0x73C, cur_pid);
+		mailbox_sw_reg_write(0x740, start_pid);
+		mailbox_sw_reg_write(0x744, (uint32_t)current->state);
+		if (cur_pid != start_pid && cur_pid != 0xFFFFFFFFu) {
+			dbg_neg_xpipe++;
+			mailbox_sw_reg_write(0x748, dbg_neg_xpipe);
+		}
+	}
 
 	/* check if 'current' is already configured */
 	switch (current->state) {

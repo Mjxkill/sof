@@ -12,6 +12,7 @@
 #include <rtos/alloc.h>
 #include <sof/lib/cpu.h>
 #include <sof/lib/dma.h>
+#include <sof/lib/mailbox.h>
 #include <sof/platform.h>
 #include <sof/schedule/ll_schedule.h>
 #include <sof/schedule/ll_schedule_domain.h>
@@ -183,13 +184,67 @@ static void dma_irq_handler(void *data)
 	 */
 	bool any_fired = false;
 
+	/* DIAG E6.b: dma_irq_handler entry count + per-channel pipeline_id
+	 * 0x580: entries (throttled 1/16), 0x588: SAI RX (PIPE 1) fired,
+	 * 0x58C: SAI TX (PIPE 2) fired (throttled 1/16)
+	 *
+	 * NEW non-throttled counters in clean zone 0x250-0x2FF:
+	 * 0x250 : entries (raw, every IRQ)
+	 * 0x254 : status_get true count (raw)
+	 * 0x258 : PIPE 1 fires (raw)
+	 * 0x25C : PIPE 2 fires (raw)
+	 * 0x260-0x27C : per-channel chan->index 0..7 fire count (raw)
+	 */
+	{
+		static volatile uint32_t dbg_entry;
+		static volatile uint32_t dbg_entry_raw;
+		dbg_entry++;
+		dbg_entry_raw++;
+		if ((dbg_entry & 0x0F) == 1)
+			mailbox_sw_reg_write(0x580, dbg_entry);
+		mailbox_sw_reg_write(0x250, dbg_entry_raw);
+	}
+
 	list_for_item(i, &irq_data->channels) {
 		chan_data = container_of(i, struct zephyr_dma_domain_channel, list);
 
 		if (dma_interrupt_legacy(chan_data->channel, DMA_IRQ_STATUS_GET)) {
+			static volatile uint32_t dbg_status_true;
+			static volatile uint32_t dbg_chan_fire[8];
 			dma_interrupt_legacy(chan_data->channel, DMA_IRQ_CLEAR);
 			chan_data->pending = true;
 			any_fired = true;
+
+			dbg_status_true++;
+			mailbox_sw_reg_write(0x254, dbg_status_true);
+			if (chan_data->channel->index < 8) {
+				dbg_chan_fire[chan_data->channel->index]++;
+				mailbox_sw_reg_write(
+					0x260 + chan_data->channel->index * 4,
+					dbg_chan_fire[chan_data->channel->index]);
+			}
+
+			/* DIAG: count fire per pipeline_id */
+			if (chan_data->pipe_task &&
+			    chan_data->pipe_task->sched_comp &&
+			    chan_data->pipe_task->sched_comp->pipeline) {
+				uint32_t pid = chan_data->pipe_task->sched_comp->pipeline->pipeline_id;
+				static volatile uint32_t dbg_p1, dbg_p2;
+				static volatile uint32_t dbg_p1_raw, dbg_p2_raw;
+				if (pid == 1) {
+					dbg_p1++;
+					dbg_p1_raw++;
+					mailbox_sw_reg_write(0x258, dbg_p1_raw);
+					if ((dbg_p1 & 0x0F) == 1)
+						mailbox_sw_reg_write(0x588, dbg_p1);
+				} else if (pid == 2) {
+					dbg_p2++;
+					dbg_p2_raw++;
+					mailbox_sw_reg_write(0x25C, dbg_p2_raw);
+					if ((dbg_p2 & 0x0F) == 1)
+						mailbox_sw_reg_write(0x58C, dbg_p2);
+				}
+			}
 		}
 	}
 

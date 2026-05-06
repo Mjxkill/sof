@@ -149,15 +149,55 @@ int module_adapter_set_state(struct processing_module *mod, struct comp_dev *dev
 		sources_active = module_source_status_count(dev, COMP_STATE_ACTIVE) ||
 				 module_source_status_count(dev, COMP_STATE_PAUSED);
 
-		/* don't stop/start module if one of the sources is active/paused */
-		if ((cmd == COMP_TRIGGER_STOP || cmd == COMP_TRIGGER_PRE_START) && sources_active) {
-			dev->state = COMP_STATE_ACTIVE;
+		/* DIAG E6.b: trace entries in num_of_sources>1 branch.
+		 * MOVED to clean zone 0x470-0x4AF (was 0x240-0x27F colliding
+		 * with dma_irq_handler 0x250-0x27C).
+		 * 0x230 : entry count
+		 * 0x234 : PATH_STOP returns from Fix-B guard
+		 * 0x238 : PATH_STOP returns from STATE_ALREADY_SET
+		 * 0x23C : final ret of comp_set_state
+		 * 0x470-0x4AF : ring 4 first (id, pipeline_id, cmd, (active<<16)|state)
+		 */
+		{
+			static volatile uint32_t dbg_msa_branch;
+			uint32_t n;
+			dbg_msa_branch++;
+			n = dbg_msa_branch;
+			mailbox_sw_reg_write(0x230, n);
+			if (n >= 1 && n <= 4) {
+				size_t base = 0x470 + (n - 1) * 16;
+				mailbox_sw_reg_write(base + 0,
+					dev->ipc_config.id);
+				mailbox_sw_reg_write(base + 4,
+					dev->ipc_config.pipeline_id);
+				mailbox_sw_reg_write(base + 8, (uint32_t)cmd);
+				mailbox_sw_reg_write(base + 12,
+					((uint32_t)sources_active << 16) |
+					(uint32_t)dev->state);
+			}
+		}
+
+		/* Fix-B (V5.4.1 E6.b) : guard dev->state == COMP_STATE_ACTIVE
+		 * pour ne retourner PATH_STOP que si ce comp est déjà actif
+		 * lui-même. Évite l'arrêt prématuré du walk quand une source
+		 * cross-pipeline est ACTIVE mais ce comp pas encore triggered.
+		 */
+		if ((cmd == COMP_TRIGGER_STOP || cmd == COMP_TRIGGER_PRE_START) &&
+		    sources_active && dev->state == COMP_STATE_ACTIVE) {
+			static volatile uint32_t dbg_msa_pstop;
+			dbg_msa_pstop++;
+			mailbox_sw_reg_write(0x234, dbg_msa_pstop);
 			return PPL_STATUS_PATH_STOP;
 		}
 
 		ret = comp_set_state(dev, cmd);
-		if (ret == COMP_STATUS_STATE_ALREADY_SET)
+		mailbox_sw_reg_write(0x23C, (uint32_t)ret);
+		if (ret == COMP_STATUS_STATE_ALREADY_SET) {
+			static volatile uint32_t dbg_msa_already;
+			dbg_msa_already++;
+			mailbox_sw_reg_write(0x238, dbg_msa_already);
 			return PPL_STATUS_PATH_STOP;
+		}
 
 		return ret;
 	}

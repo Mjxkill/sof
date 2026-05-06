@@ -11,6 +11,7 @@
 #include <sof/audio/npu_tap.h>
 #include <sof/audio/pipeline.h>
 #include <sof/common.h>
+#include <sof/lib/mailbox.h>
 #include <rtos/panic.h>
 #include <rtos/interrupt.h>
 #include <sof/ipc/msg.h>
@@ -105,12 +106,67 @@ static void dai_dma_cb(void *arg, enum notify_id type, void *data)
 	uint32_t bytes = next->elem.size;
 	int ret;
 
+	/* DIAG E6.b: count dai_dma_cb (legacy notifier) per direction.
+	 * 0x610: PLAY entry, 0x614: CAP entry, 0x618: PLAY dev->state, 0x61C: PLAY xrun
+	 */
+	{
+		static volatile uint32_t dbg_play, dbg_cap;
+		if (dev->direction == SOF_IPC_STREAM_PLAYBACK) {
+			dbg_play++;
+			mailbox_sw_reg_write(0x610, dbg_play);
+			mailbox_sw_reg_write(0x618, dev->state);
+			mailbox_sw_reg_write(0x61C, dd->xrun);
+		} else {
+			dbg_cap++;
+			if ((dbg_cap & 0x0F) == 1)
+				mailbox_sw_reg_write(0x614, dbg_cap);
+		}
+	}
+
 	comp_dbg(dev, "dai_dma_cb()");
 
 	next->status = DMA_CB_STATUS_RELOAD;
 
 	/* stop dma copy for pause/stop/xrun */
 	if (dev->state != COMP_STATE_ACTIVE || dd->xrun) {
+		/* DIAG E6.b: capture state/xrun AT THE MOMENT the STOP branch
+		 * is taken. Only first occurrence is kept (sticky).
+		 * MOVED to clean zone 0x4C0-0x4F0 (was 0x644-0x670 colliding
+		 * with sdma_set_config in sdma.c:1100-1111).
+		 * 0x4C0: STOP branch taken count (PLAY only)
+		 * 0x4C4: dev->state when STOP branch first taken
+		 * 0x4C8: dd->xrun  when STOP branch first taken
+		 * 0x4CC: dev addr at first STOP
+		 * 0x4D0: dd  addr at first STOP
+		 * 0x4D4: next ptr at first STOP
+		 * 0x4D8: next->elem.size at first STOP
+		 * 0x4DC: dd->chan->index at first STOP (= channel registered for)
+		 * 0x4E0: dev->ipc_config.id at first STOP
+		 * 0x4E4: dev->ipc_config.type at first STOP
+		 * 0x4E8: dev->ipc_config.pipeline_id at first STOP
+		 */
+		if (dev->direction == SOF_IPC_STREAM_PLAYBACK) {
+			static volatile uint32_t dbg_stop_taken;
+			dbg_stop_taken++;
+			mailbox_sw_reg_write(0x4C0, dbg_stop_taken);
+			if (dbg_stop_taken == 1) {
+				mailbox_sw_reg_write(0x4C4, dev->state);
+				mailbox_sw_reg_write(0x4C8, dd->xrun);
+				mailbox_sw_reg_write(0x4CC, (uint32_t)(uintptr_t)dev);
+				mailbox_sw_reg_write(0x4D0, (uint32_t)(uintptr_t)dd);
+				mailbox_sw_reg_write(0x4D4, (uint32_t)(uintptr_t)next);
+				if (next && next->elem.size)
+					mailbox_sw_reg_write(0x4D8, next->elem.size);
+				if (dd->chan)
+					mailbox_sw_reg_write(0x4DC, dd->chan->index);
+				else
+					mailbox_sw_reg_write(0x4DC, 0xDEADu);
+				mailbox_sw_reg_write(0x4E0, dev->ipc_config.id);
+				mailbox_sw_reg_write(0x4E4, dev->ipc_config.type);
+				mailbox_sw_reg_write(0x4E8, dev->ipc_config.pipeline_id);
+			}
+		}
+
 		/* stop the DAI */
 		dai_trigger(dd->dai, COMP_TRIGGER_STOP, dev->direction);
 
@@ -852,6 +908,23 @@ int dai_common_prepare(struct dai_data *dd, struct comp_dev *dev)
 		return 0;
 	}
 
+	/* DIAG E6.b Phase 4: trace each dma_set_config_legacy call from dai_common_prepare.
+	 * 0x760: counter, 0x764: dai_index, 0x768: ipc_config.direction
+	 * 0x76C: chan->index, 0x770: config.direction, 0x774: dev->state
+	 * 0x778: dev->pipeline->pipeline_id (which pipeline calls)
+	 */
+	{
+		static volatile uint32_t dbg_setcfg_count;
+		dbg_setcfg_count++;
+		mailbox_sw_reg_write(0x760, dbg_setcfg_count);
+		mailbox_sw_reg_write(0x764, (uint32_t)dd->ipc_config.dai_index);
+		mailbox_sw_reg_write(0x768, (uint32_t)dd->ipc_config.direction);
+		mailbox_sw_reg_write(0x76C, dd->chan ? (uint32_t)dd->chan->index : 0xFFFFFFFFu);
+		mailbox_sw_reg_write(0x770, (uint32_t)dd->config.direction);
+		mailbox_sw_reg_write(0x774, (uint32_t)dev->state);
+		mailbox_sw_reg_write(0x778, dev->pipeline ? (uint32_t)dev->pipeline->pipeline_id : 0xFFFFFFFFu);
+	}
+
 	ret = dma_set_config_legacy(dd->chan, &dd->config);
 	if (ret < 0)
 		comp_set_state(dev, COMP_TRIGGER_RESET);
@@ -995,6 +1068,29 @@ static int dai_comp_trigger_internal(struct dai_data *dd, struct comp_dev *dev, 
 		COMPILER_FALLTHROUGH;
 	case COMP_TRIGGER_STOP:
 		comp_dbg(dev, "dai_comp_trigger_internal(), STOP");
+		/* DIAG E6.b: capture identity of comp_dev triggering DAI STOP.
+		 * Moved to collision-free zone 0x1A0-0x1DF.
+		 * 0x1A0 : count of STOP triggers via dai_comp_trigger_internal
+		 * 0x1B0-0x1EF : ring of first 4 (id, pipeline_id, xrun, direction)
+		 */
+		{
+			static volatile uint32_t dbg_dct_stop;
+			uint32_t n;
+			dbg_dct_stop++;
+			n = dbg_dct_stop;
+			mailbox_sw_reg_write(0x1A0, n);
+			if (n >= 1 && n <= 4) {
+				size_t base = 0x1B0 + (n - 1) * 16;
+				mailbox_sw_reg_write(base + 0,
+					dev->ipc_config.id);
+				mailbox_sw_reg_write(base + 4,
+					dev->ipc_config.pipeline_id);
+				mailbox_sw_reg_write(base + 8,
+					(uint32_t)dd->xrun);
+				mailbox_sw_reg_write(base + 12,
+					(uint32_t)dev->direction);
+			}
+		}
 /*
  * Some platforms cannot just simple disable
  * DMA channel during the transfer,
@@ -1118,6 +1214,21 @@ int dai_common_copy(struct dai_data *dd, struct comp_dev *dev, pcm_converter_fun
 	uint32_t samples;
 	int ret;
 
+	/* DIAG E6.b: count dai_common_copy (legacy) per direction.
+	 * 0x620: PLAY entry, 0x624: CAP entry, 0x628: PLAY last avail, 0x62C: PLAY last copy_bytes
+	 */
+	{
+		static volatile uint32_t dbg_play, dbg_cap;
+		if (dev->direction == SOF_IPC_STREAM_PLAYBACK) {
+			dbg_play++;
+			mailbox_sw_reg_write(0x620, dbg_play);
+		} else {
+			dbg_cap++;
+			if ((dbg_cap & 0x0F) == 1)
+				mailbox_sw_reg_write(0x624, dbg_cap);
+		}
+	}
+
 	/* get data sizes from DMA */
 	ret = dma_get_data_size_legacy(dd->chan, &avail_bytes, &free_bytes);
 	if (ret < 0) {
@@ -1162,12 +1273,43 @@ int dai_common_copy(struct dai_data *dd, struct comp_dev *dev, pcm_converter_fun
 
 	/* return if nothing to copy */
 	if (!copy_bytes) {
+		/* DIAG E6.b: count "nothing to copy" early return per direction.
+		 * 0x628: PLAY zero-copy returns, 0x62C: CAP zero-copy returns
+		 */
+		{
+			static volatile uint32_t dbg_zp, dbg_zc;
+			if (dev->direction == SOF_IPC_STREAM_PLAYBACK) {
+				dbg_zp++;
+				mailbox_sw_reg_write(0x628, dbg_zp);
+			} else {
+				dbg_zc++;
+				if ((dbg_zc & 0x0F) == 1)
+					mailbox_sw_reg_write(0x62C, dbg_zc);
+			}
+		}
 		comp_warn(dev, "dai_common_copy(): nothing to copy");
 		return 0;
 	}
 
 	if (dd->dai->drv->ops.copy)
 		dd->dai->drv->ops.copy(dd->dai);
+
+	/* DIAG E6.b: count effective dma_copy_legacy calls per direction.
+	 * 0x630 reserved by sdma dma_set_config dump; use 0x638/0x63C for dai
+	 * but they are also reserved. Use 0x648 PLAY dma_copy and 0x64C CAP.
+	 * Wait those are reserved too. Use 0x6A4/0x6A8 for dai dma_copy fired.
+	 */
+	{
+		static volatile uint32_t dbg_dp, dbg_dc;
+		if (dev->direction == SOF_IPC_STREAM_PLAYBACK) {
+			dbg_dp++;
+			mailbox_sw_reg_write(0x6A4, dbg_dp);
+		} else {
+			dbg_dc++;
+			if ((dbg_dc & 0x0F) == 1)
+				mailbox_sw_reg_write(0x6A8, dbg_dc);
+		}
+	}
 
 	ret = dma_copy_legacy(dd->chan, copy_bytes, 0);
 	if (ret < 0) {

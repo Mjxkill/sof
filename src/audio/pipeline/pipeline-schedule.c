@@ -10,6 +10,7 @@
 #include <sof/audio/pipeline.h>
 #include <rtos/interrupt.h>
 #include <sof/lib/agent.h>
+#include <sof/lib/mailbox.h>
 #include <sof/list.h>
 #include <sof/schedule/ll_schedule.h>
 #include <sof/schedule/dp_schedule.h>
@@ -169,6 +170,22 @@ static enum task_state pipeline_task(void *arg)
 	};
 	struct pipeline *p = arg;
 	int err;
+
+	/* DIAG E6.b: pipeline_task body counter per pipeline_id (throttled 1/16).
+	 * 0x570: PIPE 1, 0x574: PIPE 2
+	 */
+	{
+		static volatile uint32_t dbg_p1, dbg_p2;
+		if (p->pipeline_id == 1) {
+			dbg_p1++;
+			if ((dbg_p1 & 0x0F) == 1)
+				mailbox_sw_reg_write(0x570, dbg_p1);
+		} else if (p->pipeline_id == 2) {
+			dbg_p2++;
+			if ((dbg_p2 & 0x0F) == 1)
+				mailbox_sw_reg_write(0x574, dbg_p2);
+		}
+	}
 
 	pipe_dbg(p, "pipeline_task()");
 

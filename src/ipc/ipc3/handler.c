@@ -512,6 +512,13 @@ static int ipc_stream_trigger(uint32_t header)
 		ipc->task_mask |= IPC_TASK_IN_THREAD;
 		k_spin_unlock(&ipc->lock, key);
 
+		/* DIAG E6.b: count IPC3 trigger via pipeline_trigger (timer-driven) */
+		{
+			static volatile uint32_t dbg_ipc_pt;
+			dbg_ipc_pt++;
+			mailbox_sw_reg_write(0x3C0, dbg_ipc_pt);
+			mailbox_sw_reg_write(0x3C4, (uint32_t)cmd);
+		}
 		ret = pipeline_trigger(pcm_dev->cd->pipeline, pcm_dev->cd, cmd);
 		if (ret <= 0) {
 			key = k_spin_lock(&ipc->lock);
@@ -519,6 +526,13 @@ static int ipc_stream_trigger(uint32_t header)
 			k_spin_unlock(&ipc->lock, key);
 		}
 	} else {
+		/* DIAG E6.b: count IPC3 trigger via pipeline_trigger_run (DMA-driven) */
+		{
+			static volatile uint32_t dbg_ipc_ptr;
+			dbg_ipc_ptr++;
+			mailbox_sw_reg_write(0x3D0, dbg_ipc_ptr);
+			mailbox_sw_reg_write(0x3D4, (uint32_t)cmd);
+		}
 		ret = pipeline_trigger_run(pcm_dev->cd->pipeline, pcm_dev->cd, cmd);
 	}
 

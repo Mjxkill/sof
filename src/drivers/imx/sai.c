@@ -12,6 +12,7 @@
 #include <sof/drivers/sai.h>
 #include <sof/lib/dai.h>
 #include <sof/lib/dma.h>
+#include <sof/lib/mailbox.h>
 #include <rtos/wait.h>
 #include <sof/lib/uuid.h>
 #include <ipc/dai.h>
@@ -39,6 +40,18 @@ static void sai_start(struct dai *dai, int direction)
 	uint32_t xcsr = 0U;
 	int i;
 	int n;
+
+	/* DIAG E6.b: count sai_start entry per direction */
+	{
+		static volatile uint32_t dbg_start_tx, dbg_start_rx;
+		if (direction == DAI_DIR_PLAYBACK) {
+			dbg_start_tx++;
+			mailbox_sw_reg_write(0x720, dbg_start_tx);
+		} else {
+			dbg_start_rx++;
+			mailbox_sw_reg_write(0x730, dbg_start_rx);
+		}
+	}
 #ifdef CONFIG_IMX8ULP
 	int fifo_offset = 0;
 #endif
@@ -103,8 +116,12 @@ static void sai_start(struct dai *dai, int direction)
 	 * the clock generators (only TE/BCE do).
 	 */
 	if (direction == DAI_DIR_PLAYBACK && sai->configured) {
+		static volatile uint32_t dbg_start_tx_cfg;
+		dbg_start_tx_cfg++;
+		mailbox_sw_reg_write(0x724, dbg_start_tx_cfg);
 		dai_update_bits(dai, REG_SAI_XCSR(direction),
 				REG_SAI_CSR_FRDE, REG_SAI_CSR_FRDE);
+		mailbox_sw_reg_write(0x728, dai_read(dai, REG_SAI_TCSR));
 		return;
 	}
 
@@ -139,6 +156,12 @@ static void sai_start(struct dai *dai, int direction)
 	/* transmitter/receiver enable */
 	dai_update_bits(dai, REG_SAI_XCSR(direction),
 			REG_SAI_CSR_TERE, REG_SAI_CSR_TERE);
+
+	/* DIAG E6.b: dump TCSR/RCSR after sai_start (non-configured branch) */
+	if (direction == DAI_DIR_PLAYBACK)
+		mailbox_sw_reg_write(0x728, dai_read(dai, REG_SAI_TCSR));
+	else
+		mailbox_sw_reg_write(0x734, dai_read(dai, REG_SAI_RCSR));
 }
 
 static void sai_release(struct dai *dai, int direction)
@@ -190,6 +213,35 @@ static void sai_stop(struct dai *dai, int direction)
 
 	struct sai_pdata *sai = dai_get_drvdata(dai);
 	int ret = 0;
+
+	/* DIAG E6.b: count sai_stop entry per direction.
+	 * OLD offsets 0x740/0x744 colliding with pipeline-params; NEW clean
+	 * offsets in 0x340-0x35F.
+	 * 0x340 : total sai_stop calls
+	 * 0x344 : last direction seen
+	 * 0x348 : sai_stop TX count (clean)
+	 * 0x34C : sai_stop RX count (clean)
+	 * 0x350-0x35F : ring 4 first directions
+	 */
+	{
+		static volatile uint32_t dbg_stop_tx, dbg_stop_rx;
+		static volatile uint32_t dbg_stop_total;
+		uint32_t n;
+		dbg_stop_total++;
+		n = dbg_stop_total;
+		mailbox_sw_reg_write(0x340, n);
+		mailbox_sw_reg_write(0x344, (uint32_t)direction);
+		if (n >= 1 && n <= 4)
+			mailbox_sw_reg_write(0x350 + (n - 1) * 4,
+					     (uint32_t)direction);
+		if (direction == DAI_DIR_PLAYBACK) {
+			dbg_stop_tx++;
+			mailbox_sw_reg_write(0x348, dbg_stop_tx);
+		} else {
+			dbg_stop_rx++;
+			mailbox_sw_reg_write(0x34C, dbg_stop_rx);
+		}
+	}
 
 	/* IDEMPOTENCE TX: once configured, only clear FRDE on stop (= disable
 	 * DMA request, drains the FIFO). Skip TERE/TRCE/XIE which would
@@ -488,12 +540,50 @@ static inline int sai_set_config(struct dai *dai, struct ipc_config_dai *common_
 #endif
 
 	sai->configured = true;
+
+	/* DIAG E6.b: dump SAI registers after sai_set_config completes.
+	 * 0x700=tag, 0x704=count, 0x708=TCSR, 0x70C=RCSR, 0x710=MCTL.
+	 */
+	{
+		static volatile uint32_t dbg_cfg_count;
+		dbg_cfg_count++;
+		mailbox_sw_reg_write(0x700, 0xCAFE5A17);
+		mailbox_sw_reg_write(0x704, dbg_cfg_count);
+		mailbox_sw_reg_write(0x708, dai_read(dai, REG_SAI_TCSR));
+		mailbox_sw_reg_write(0x70C, dai_read(dai, REG_SAI_RCSR));
+#if defined(CONFIG_IMX8M) || defined(CONFIG_IMX93_A55)
+		mailbox_sw_reg_write(0x710, dai_read(dai, REG_SAI_MCTL));
+#endif
+	}
+
 	return 0;
 }
 
 static int sai_trigger(struct dai *dai, int cmd, int direction)
 {
 	dai_info(dai, "SAI: sai_trigger");
+
+	/* DIAG E6.b: trace sai_trigger calls (sticky for first 4 calls).
+	 * Moved to collision-free zone 0x200-0x21F.
+	 * 0x200 : total count
+	 * 0x204 : last cmd
+	 * 0x208 : last direction
+	 * 0x210-0x22F : first 4 (cmd, dir) pairs
+	 */
+	{
+		static volatile uint32_t dbg_trig;
+		uint32_t n;
+		dbg_trig++;
+		n = dbg_trig;
+		mailbox_sw_reg_write(0x200, n);
+		mailbox_sw_reg_write(0x204, (uint32_t)cmd);
+		mailbox_sw_reg_write(0x208, (uint32_t)direction);
+		if (n >= 1 && n <= 4) {
+			size_t base = 0x210 + (n - 1) * 8;
+			mailbox_sw_reg_write(base + 0, (uint32_t)cmd);
+			mailbox_sw_reg_write(base + 4, (uint32_t)direction);
+		}
+	}
 
 	switch (cmd) {
 	case COMP_TRIGGER_START:
