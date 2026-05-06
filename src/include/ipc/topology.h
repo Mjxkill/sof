@@ -313,6 +313,16 @@ struct sof_ipc_pipe_free {
 	uint32_t comp_id;
 } __attribute__((packed, aligned(4)));
 
+/* V6.0: trigger pipeline by pipeline_id - SOF_IPC_TPLG_PIPE_TRIGGER.
+ * Used by kernel to start/stop always-on DAI-to-DAI pipelines without
+ * requiring a PCM host comp lookup.
+ */
+struct sof_ipc_pipe_trigger {
+	struct sof_ipc_cmd_hdr hdr;
+	uint32_t pipeline_id;	/**< target pipeline ID */
+	uint32_t cmd;		/**< COMP_TRIGGER_* (PRE_START, START, STOP, ...) */
+} __attribute__((packed, aligned(4)));
+
 /* connect two components in pipeline - SOF_IPC_TPLG_COMP_CONNECT */
 struct sof_ipc_pipe_comp_connect {
 	struct sof_ipc_cmd_hdr hdr;

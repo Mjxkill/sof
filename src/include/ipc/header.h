@@ -223,6 +223,13 @@ struct ipc_cmd_hdr;
 #define SOF_IPC_TPLG_BUFFER_NEW			SOF_CMD_TYPE(0x020)
 #define SOF_IPC_TPLG_BUFFER_FREE		SOF_CMD_TYPE(0x021)
 
+/* V6.0: trigger a pipeline by pipeline_id (no pcm_dev required).
+ * Used by kernel to start always-on DAI-to-DAI pipelines AFTER the DAI
+ * has been configured (SOF_IPC_DAI_CONFIG). See struct sof_ipc_pipe_trigger
+ * in topology.h.
+ */
+#define SOF_IPC_TPLG_PIPE_TRIGGER		SOF_CMD_TYPE(0x014)
+
 /** @} */
 
 /** \name DSP Command: PM

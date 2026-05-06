@@ -1389,6 +1389,62 @@ static int ipc_glb_tplg_comp_connect(uint32_t header)
 	return ipc_comp_connect(ipc, ipc->comp_data);
 }
 
+/* V6.0 F4: trigger pipeline by pipeline_id (no pcm_dev required).
+ *
+ * The kernel uses this IPC to start always-on DAI-to-DAI pipelines after
+ * SOF_IPC_DAI_CONFIG, where the regular ipc_stream_trigger() path can't be
+ * used (it requires a host PCM comp lookup by stream.comp_id).
+ *
+ * For PRE_START commands, prepare the pipeline first. Subsequent START /
+ * STOP / PAUSE commands go through pipeline_trigger() unchanged.
+ *
+ * Anchor: source_comp first, sink_comp fallback. For NO_HOST pipelines
+ * source_comp is a DAI (capture side), sink_comp is another DAI (playback
+ * side). pipeline_trigger() accepts any comp as the `host` argument — it
+ * does not check type, only uses it as the start point of the trigger walk.
+ */
+static int ipc_glb_tplg_pipe_trigger(uint32_t header)
+{
+	struct ipc *ipc = ipc_get();
+	struct sof_ipc_pipe_trigger msg;
+	struct ipc_comp_dev *ipc_pipe;
+	struct pipeline *p;
+	struct comp_dev *anchor;
+	int ret;
+
+	IPC_COPY_CMD(msg, ipc->comp_data);
+
+	ipc_pipe = ipc_get_pipeline_by_id(ipc, msg.pipeline_id);
+	if (!ipc_pipe || !ipc_pipe->pipeline) {
+		ipc_cmd_err(&ipc_tr, "pipe_trigger: pipeline_id %u not found",
+			    msg.pipeline_id);
+		return -EINVAL;
+	}
+	p = ipc_pipe->pipeline;
+
+	anchor = p->source_comp ? p->source_comp : p->sink_comp;
+	if (!anchor) {
+		ipc_cmd_err(&ipc_tr, "pipe_trigger: pipeline %u no anchor comp",
+			    msg.pipeline_id);
+		return -EINVAL;
+	}
+
+	tr_info(&ipc_tr, "pipe_trigger: pipeline %u cmd %u",
+		msg.pipeline_id, msg.cmd);
+
+	if (msg.cmd == COMP_TRIGGER_PRE_START) {
+		ret = pipeline_prepare(p, anchor);
+		if (ret < 0) {
+			ipc_cmd_err(&ipc_tr,
+				    "pipe_trigger: prepare failed pipeline %u ret %d",
+				    msg.pipeline_id, ret);
+			return ret;
+		}
+	}
+
+	return pipeline_trigger(p, anchor, msg.cmd);
+}
+
 static int ipc_glb_tplg_free(uint32_t header,
 		int (*free_func)(struct ipc *ipc, uint32_t id))
 {
@@ -1433,6 +1489,8 @@ static int ipc_glb_tplg_message(uint32_t header)
 		return ipc_glb_tplg_buffer_new(header);
 	case SOF_IPC_TPLG_BUFFER_FREE:
 		return ipc_glb_tplg_free(header, ipc_buffer_free);
+	case SOF_IPC_TPLG_PIPE_TRIGGER:
+		return ipc_glb_tplg_pipe_trigger(header);
 	default:
 		ipc_cmd_err(&ipc_tr, "ipc: unknown tplg header 0x%x", header);
 		return -EINVAL;
