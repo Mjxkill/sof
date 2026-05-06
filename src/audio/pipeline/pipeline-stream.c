@@ -629,6 +629,25 @@ int pipeline_trigger_run(struct pipeline *p, struct comp_dev *host, int cmd)
 	};
 	int ret;
 
+	/* V6.0 F3: pipelines flagged PIPELINE_ATTR_IGNORE_STOP swallow STOP
+	 * and PAUSE triggers — typically used by always-on DAI-to-DAI loopback
+	 * pipelines that must keep running across PCM open/close cycles.
+	 *
+	 * Returning PPL_STATUS_PATH_STOP halts the trigger walk for the caller
+	 * (so sibling pipelines don't propagate STOP further) but does NOT
+	 * change p->status, leaving the pipeline_task scheduled.
+	 *
+	 * Scope: 1 location for now. If empirical tests show STOP still leaks
+	 * via pipeline_comp_trigger() cross-pipeline propagation, extend the
+	 * check there too (decision tracked in TESTS/PLAN_V6.0_ALWAYS_ON.md).
+	 */
+	if ((p->attributes & PIPELINE_ATTR_IGNORE_STOP) &&
+	    (cmd == COMP_TRIGGER_STOP || cmd == COMP_TRIGGER_PAUSE)) {
+		pipe_info(p, "always-on ppl %d: ignoring trigger cmd %d",
+			  p->pipeline_id, cmd);
+		return PPL_STATUS_PATH_STOP;
+	}
+
 	/* DIAG E6.b: trace pipeline_trigger_run entry (clean zone 0x360).
 	 * 0x360 : total entries
 	 * 0x364 : last cmd

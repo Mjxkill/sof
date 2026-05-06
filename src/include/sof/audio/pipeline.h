@@ -49,6 +49,24 @@ struct ipc_msg;
 #define PPL_DIR_DOWNSTREAM	0
 #define PPL_DIR_UPSTREAM	1
 
+/* V6.0: pipeline attribute flags carried in pipeline.attributes (uint32_t).
+ *
+ * The struct field already exists for IPC4 (`enum ipc4_pipeline_attributes`
+ * — IPC4_ULTRA_LOW_POWER, IPC4_AUTONOMOUS_RESET). For IPC3, the field is
+ * unused so we reuse it for V6.0 always-on semantics.
+ *
+ * IPC3 does NOT extend `struct sof_ipc_pipe_new` (ABI back-compat). The
+ * attributes field is set by a separate IPC SET message OR via a topology
+ * token parsed kernel-side (K1-K5). See TESTS/PLAN_V6.0_ALWAYS_ON.md.
+ *
+ * PIPELINE_ATTR_ALWAYS_ON   — auto-start pipeline post-tplg+DAI_CONFIG, never STOP
+ * PIPELINE_ATTR_IGNORE_STOP — STOP/PAUSE return PPL_STATUS_PATH_STOP (no-op)
+ * PIPELINE_ATTR_NO_HOST     — DAI-to-DAI pipeline (no PCM host comp)
+ */
+#define PIPELINE_ATTR_ALWAYS_ON		BIT(0)
+#define PIPELINE_ATTR_IGNORE_STOP	BIT(1)
+#define PIPELINE_ATTR_NO_HOST		BIT(2)
+
 /*
  * Audio pipeline.
  */
