@@ -31,6 +31,9 @@ SectionVendorTokens."sof_sched_tokens" {
 	SOF_TKN_SCHED_FRAMES			"204"
 	SOF_TKN_SCHED_TIME_DOMAIN		"205"
 	SOF_TKN_SCHED_DYNAMIC_PIPELINE		"206"
+	# V6.0: pipeline always-on attribute. Kernel parses this token and
+	# triggers the pipeline post-DAI_CONFIG via SOF_IPC_TPLG_PIPE_TRIGGER.
+	SOF_TKN_PIPE_ALWAYS_ON			"224"
 }
 
 SectionVendorTokens."sof_volume_tokens" {

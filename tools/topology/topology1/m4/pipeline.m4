@@ -32,6 +32,7 @@ define(`W_PIPELINE',
 `		SOF_TKN_SCHED_FRAMES'		"0"
 `		SOF_TKN_SCHED_TIME_DOMAIN'	STR($5)
 `		SOF_TKN_SCHED_DYNAMIC_PIPELINE'	ifdef(`DYNAMIC', "1", ifelse(DYNAMIC_PIPE, `1', "1", "0"))
+`		SOF_TKN_PIPE_ALWAYS_ON'		ifdef(`PIPELINE_ALWAYS_ON', "1", "0")
 `	}'
 `}'
 `SectionData."'N_PIPELINE($1)`_data" {'
@@ -203,6 +204,24 @@ define(`PIPELINE_ADD',
 `undefine(`PIPELINE_RATE')'
 `undefine(`DYNAMIC_PIPE')'
 ,`fatal_error(`Invalid parameters ($#) to PIPELINE_ADD')')'
+)
+
+dnl V6.0: PIPELINE_ALWAYS_ON_ADD(pipeline,
+dnl     pipe id, max channels, format,
+dnl     period, priority, core,
+dnl     sched_comp, time_domain,
+dnl     pcm_min_rate, pcm_max_rate, pipeline_rate, dynamic)
+dnl
+dnl Same as PIPELINE_ADD but emits SOF_TKN_PIPE_ALWAYS_ON=1 in the
+dnl scheduler widget tuples. The kernel parses this token and triggers
+dnl the pipeline post-DAI_CONFIG via SOF_IPC_TPLG_PIPE_TRIGGER.
+dnl
+dnl Use for DAI-to-DAI loopback pipelines that must run independently
+dnl of any PCM lifecycle.
+define(`PIPELINE_ALWAYS_ON_ADD',
+`define(`PIPELINE_ALWAYS_ON', `1')'
+`PIPELINE_ADD($@)'
+`undefine(`PIPELINE_ALWAYS_ON')'
 )
 
 divert(0)dnl
