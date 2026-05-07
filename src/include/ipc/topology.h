@@ -316,11 +316,24 @@ struct sof_ipc_pipe_free {
 /* V6.0: trigger pipeline by pipeline_id - SOF_IPC_TPLG_PIPE_TRIGGER.
  * Used by kernel to start/stop always-on DAI-to-DAI pipelines without
  * requiring a PCM host comp lookup.
+ *
+ * On PRE_START, the handler calls pipeline_params() before pipeline_prepare()
+ * (mirroring the PCM hw_params flow). The params fields below are consumed
+ * only for PRE_START — other cmds ignore them.
+ *
+ * NOTE on pipeline_id semantics: this field carries the comp_id of the
+ * scheduler widget (NOT the topology pipeline_id). ipc_get_pipeline_by_id()
+ * actually resolves by comp_id despite its macro name.
  */
 struct sof_ipc_pipe_trigger {
 	struct sof_ipc_cmd_hdr hdr;
-	uint32_t pipeline_id;	/**< target pipeline ID */
+	uint32_t pipeline_id;	/**< scheduler comp_id (firmware-side icd->id) */
 	uint32_t cmd;		/**< COMP_TRIGGER_* (PRE_START, START, STOP, ...) */
+	/* params consumed only on PRE_START to drive pipeline_params() */
+	uint32_t rate;		/**< sample rate, e.g. 48000 */
+	uint32_t channels;	/**< channel count */
+	uint32_t frame_fmt;	/**< enum sof_ipc_frame */
+	uint32_t direction;	/**< SOF_IPC_STREAM_PLAYBACK/CAPTURE */
 } __attribute__((packed, aligned(4)));
 
 /* connect two components in pipeline - SOF_IPC_TPLG_COMP_CONNECT */

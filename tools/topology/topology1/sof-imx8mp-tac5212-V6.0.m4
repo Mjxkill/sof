@@ -51,13 +51,15 @@ include(`sof/tokens.m4')
 include(`platform/imx/imx8.m4')
 
 #
-# PIPE 1 — Always-on DAI-to-DAI loopback (no HOST, no PCM)
+# PIPE 1 — All on pipeline_id=1: buffer scheduler (BUF1.0) + DAI capture
+# (SAI7.IN) + DAI playback (SAI7.OUT). 3 W_PIPELINEs sharing the same
+# pipeline_id is non-standard but required here so ipc_get_ppl_src_comp
+# finds valid SAI RX (source) and SAI TX (sink) endpoints — a buffer-only
+# pipeline_id has no COMP_TYPE_COMPONENT and ipc_pipeline_complete()
+# returns -EINVAL.
 #
-# Note: PIPELINE_ADD here only creates the loopback buffer scheduler
-# (no real source/sink comp anchor). The actual always-on flag must be
-# set on the DAI capture's W_PIPELINE (which has source_comp = SAI RX
-# comp_dai), so the kernel-side K1 trigger can find a valid anchor for
-# pipeline_prepare/pipeline_trigger firmware-side.
+# always_on flag is on the DAI capture scheduler (SAI7.IN) which has
+# a valid source_comp = SAI RX comp_dai → valid anchor for K1 trigger.
 #
 PIPELINE_ADD(sof/pipe-dai-to-dai-loopback.m4,
 	1, 8, s32le,
@@ -65,8 +67,6 @@ PIPELINE_ADD(sof/pipe-dai-to-dai-loopback.m4,
 	0, SCHEDULE_TIME_DOMAIN_DMA,
 	48000, 48000, 48000)
 
-# DAI capture (SAI7 RX) anchored on PIPE 1 sink (B0). Mark its
-# scheduler as always-on so K1 triggers it post-PIPE_COMPLETE.
 define(`PIPELINE_ALWAYS_ON', `1')
 DAI_ADD(sof/pipe-dai-capture.m4,
 	1, SAI, 7, tac5212-hifi,
@@ -74,7 +74,6 @@ DAI_ADD(sof/pipe-dai-capture.m4,
 	2000, 0, 0, SCHEDULE_TIME_DOMAIN_DMA)
 undefine(`PIPELINE_ALWAYS_ON')
 
-# DAI playback (SAI7 TX) anchored on PIPE 1 source (B0, same buffer)
 DAI_ADD(sof/pipe-dai-playback.m4,
 	1, SAI, 7, tac5212-hifi,
 	PIPELINE_SOURCE_1, 2, s32le,

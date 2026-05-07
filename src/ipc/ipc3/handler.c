@@ -1429,10 +1429,51 @@ static int ipc_glb_tplg_pipe_trigger(uint32_t header)
 		return -EINVAL;
 	}
 
-	tr_info(&ipc_tr, "pipe_trigger: pipeline %u cmd %u",
-		msg.pipeline_id, msg.cmd);
+	tr_info(&ipc_tr, "pipe_trigger: pipeline %u cmd %u rate %u ch %u",
+		msg.pipeline_id, msg.cmd, msg.rate, msg.channels);
+	tr_info(&ipc_tr, "pipe_trigger: fmt %u dir %u",
+		msg.frame_fmt, msg.direction);
 
 	if (msg.cmd == COMP_TRIGGER_PRE_START) {
+		/* V6.0 fix Bug A: PCM hw_params equivalent must run before prepare,
+		 * else dai_*_params() never executes and dd->config.elem_array.elems
+		 * stays NULL → dai_common_prepare() returns -EINVAL. Also drives the
+		 * COMP_STATE_READY → COMP_STATE_PREPARE transition required by
+		 * comp_set_state(PRE_START).
+		 *
+		 * NO_HOST: host_period_bytes = 0, buffer.size = 0, comp_id = anchor's.
+		 * The anchor's direction is forced to msg.direction so pipeline_params
+		 * walk picks the right direction.
+		 */
+		struct sof_ipc_pcm_params params_msg = {
+			.hdr = {
+				.size = sizeof(params_msg),
+				.cmd = SOF_IPC_GLB_STREAM_MSG | SOF_IPC_STREAM_PCM_PARAMS,
+			},
+			.comp_id = anchor->ipc_config.id,
+			.params = {
+				.hdr = { .size = sizeof(params_msg.params) },
+				.direction = msg.direction,
+				.frame_fmt = msg.frame_fmt,
+				.buffer_fmt = SOF_IPC_BUFFER_INTERLEAVED,
+				.rate = msg.rate,
+				.channels = (uint16_t)msg.channels,
+				.sample_valid_bytes = (msg.frame_fmt == SOF_IPC_FRAME_S16_LE) ? 2 : 4,
+				.sample_container_bytes = (msg.frame_fmt == SOF_IPC_FRAME_S16_LE) ? 2 : 4,
+				.host_period_bytes = 0,
+			},
+		};
+
+		anchor->direction = msg.direction;
+
+		ret = pipeline_params(p, anchor, &params_msg);
+		if (ret < 0) {
+			ipc_cmd_err(&ipc_tr,
+				    "pipe_trigger: params failed pipeline %u ret %d",
+				    msg.pipeline_id, ret);
+			return ret;
+		}
+
 		ret = pipeline_prepare(p, anchor);
 		if (ret < 0) {
 			ipc_cmd_err(&ipc_tr,
