@@ -1010,7 +1010,24 @@ static int dai_comp_trigger_internal(struct dai_data *dd, struct comp_dev *dev, 
 
 	comp_dbg(dev, "dai_comp_trigger_internal(), command = %u", cmd);
 
+	/* DIAG V6.0: trace dai_comp_trigger_internal entry for START (clean zone 0x780) */
+	if (cmd == COMP_TRIGGER_START) {
+		static volatile uint32_t dbg_dct_start;
+		dbg_dct_start++;
+		mailbox_sw_reg_write(0x780, dbg_dct_start);
+		mailbox_sw_reg_write(0x784, (uint32_t)dev->ipc_config.id);
+		mailbox_sw_reg_write(0x788, (uint32_t)dev->state);
+		mailbox_sw_reg_write(0x78C, (uint32_t)dev->direction);
+	}
+
 	ret = comp_set_state(dev, cmd);
+
+	/* DIAG V6.0: capture comp_set_state result */
+	if (cmd == COMP_TRIGGER_START) {
+		mailbox_sw_reg_write(0x790, (uint32_t)ret);
+		mailbox_sw_reg_write(0x794, (uint32_t)dev->state);
+	}
+
 	if (ret < 0)
 		return ret;
 
@@ -1021,13 +1038,19 @@ static int dai_comp_trigger_internal(struct dai_data *dd, struct comp_dev *dev, 
 	case COMP_TRIGGER_START:
 		comp_dbg(dev, "dai_comp_trigger_internal(), START");
 
+		/* DIAG V6.0: trace dma_start_legacy result */
+		mailbox_sw_reg_write(0x798, (uint32_t)(dd->chan ? dd->chan->index : 0xFFFFFFFFu));
+		mailbox_sw_reg_write(0x79C, (uint32_t)dd->xrun);
+
 		/* only start the DAI if we are not XRUN handling */
 		if (dd->xrun == 0) {
 			ret = dma_start_legacy(dd->chan);
+			mailbox_sw_reg_write(0x7A0, (uint32_t)ret);
 			if (ret < 0)
 				return ret;
 			/* start the DAI */
 			dai_trigger(dd->dai, cmd, dev->direction);
+			mailbox_sw_reg_write(0x7A4, 0xCAFEF00Du); /* dai_trigger called */
 		} else {
 			dd->xrun = 0;
 		}

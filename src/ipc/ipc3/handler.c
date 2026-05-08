@@ -1422,6 +1422,17 @@ static int ipc_glb_tplg_pipe_trigger(uint32_t header)
 	}
 	p = ipc_pipe->pipeline;
 
+	/* V6.0: PIPE_TRIGGER is only ever sent for always-on DAI-to-DAI
+	 * NO_HOST pipelines. IPC3 ipc_pipeline_new() does not propagate
+	 * attributes from topology (unlike IPC4 helper.c:233), so we set
+	 * them here on the target pipeline. This unlocks the NO_HOST walk
+	 * direction override in pipeline_params/pipeline_prepare/
+	 * pipeline_trigger_run, and the IGNORE_STOP filter in
+	 * pipeline_trigger_run for subsequent STOP/PAUSE.
+	 */
+	p->attributes |= PIPELINE_ATTR_ALWAYS_ON | PIPELINE_ATTR_IGNORE_STOP |
+			 PIPELINE_ATTR_NO_HOST;
+
 	anchor = p->source_comp ? p->source_comp : p->sink_comp;
 	if (!anchor) {
 		ipc_cmd_err(&ipc_tr, "pipe_trigger: pipeline %u no anchor comp",
@@ -1434,56 +1445,108 @@ static int ipc_glb_tplg_pipe_trigger(uint32_t header)
 	tr_info(&ipc_tr, "pipe_trigger: fmt %u dir %u",
 		msg.frame_fmt, msg.direction);
 
-	if (msg.cmd == COMP_TRIGGER_PRE_START) {
-		/* V6.0 fix Bug A: PCM hw_params equivalent must run before prepare,
-		 * else dai_*_params() never executes and dd->config.elem_array.elems
-		 * stays NULL → dai_common_prepare() returns -EINVAL. Also drives the
-		 * COMP_STATE_READY → COMP_STATE_PREPARE transition required by
-		 * comp_set_state(PRE_START).
-		 *
-		 * NO_HOST: host_period_bytes = 0, buffer.size = 0, comp_id = anchor's.
-		 * The anchor's direction is forced to msg.direction so pipeline_params
-		 * walk picks the right direction.
+	/* V6.0 NO_HOST DAI-to-DAI loopback: the topology has TWO DAI endpoints
+	 * with opposite directions (source_comp = capture DAI, sink_comp =
+	 * playback DAI). A single pipeline_params() call propagates a single
+	 * direction to all walked comps via pipeline_comp_params() (which
+	 * sets current->direction = params->direction at line ~124 of
+	 * pipeline-params.c). That overwrites the playback DAI's direction
+	 * with CAPTURE → state machine breaks.
+	 *
+	 * Fix: run params/prepare/trigger TWICE — once anchored on
+	 * source_comp with CAPTURE direction (walks UPSTREAM = empty for
+	 * a source DAI, so only paramétrise/prepare/trigger source_comp
+	 * itself), once anchored on sink_comp with PLAYBACK direction
+	 * (walks DOWNSTREAM = empty for a sink DAI, so only paramétrise
+	 * sink_comp itself). The buffer B0 between them is reachable as
+	 * dd->local_buffer in each DAI and gets configured implicitly by
+	 * each dai_common_params() call.
+	 */
+	{
+		struct comp_dev *snk = p->sink_comp;
+		int dir_snk = snk ? snk->direction : 0;
+
+		/* V6.0 minimal: trigger ONLY the TX (sink, master) DAI to
+		 * validate basic infrastructure. Once TX activates BCLK,
+		 * subsequent iteration will add RX (source, slave) trigger.
 		 */
-		struct sof_ipc_pcm_params params_msg = {
-			.hdr = {
-				.size = sizeof(params_msg),
-				.cmd = SOF_IPC_GLB_STREAM_MSG | SOF_IPC_STREAM_PCM_PARAMS,
-			},
-			.comp_id = anchor->ipc_config.id,
-			.params = {
-				.hdr = { .size = sizeof(params_msg.params) },
-				.direction = msg.direction,
-				.frame_fmt = msg.frame_fmt,
-				.buffer_fmt = SOF_IPC_BUFFER_INTERLEAVED,
-				.rate = msg.rate,
-				.channels = (uint16_t)msg.channels,
-				.sample_valid_bytes = (msg.frame_fmt == SOF_IPC_FRAME_S16_LE) ? 2 : 4,
-				.sample_container_bytes = (msg.frame_fmt == SOF_IPC_FRAME_S16_LE) ? 2 : 4,
-				.host_period_bytes = 0,
-			},
-		};
-
-		anchor->direction = msg.direction;
-
-		ret = pipeline_params(p, anchor, &params_msg);
-		if (ret < 0) {
+		if (!snk) {
 			ipc_cmd_err(&ipc_tr,
-				    "pipe_trigger: params failed pipeline %u ret %d",
-				    msg.pipeline_id, ret);
-			return ret;
+				    "pipe_trigger: pipeline %u no sink_comp",
+				    msg.pipeline_id);
+			return -EINVAL;
 		}
 
-		ret = pipeline_prepare(p, anchor);
-		if (ret < 0) {
-			ipc_cmd_err(&ipc_tr,
-				    "pipe_trigger: prepare failed pipeline %u ret %d",
-				    msg.pipeline_id, ret);
-			return ret;
+		if (msg.cmd == COMP_TRIGGER_PRE_START) {
+			struct sof_ipc_pcm_params params_snk = {
+				.hdr = {
+					.size = sizeof(params_snk),
+					.cmd = SOF_IPC_GLB_STREAM_MSG | SOF_IPC_STREAM_PCM_PARAMS,
+				},
+				.comp_id = snk->ipc_config.id,
+				.params = {
+					.hdr = { .size = sizeof(params_snk.params) },
+					.direction = dir_snk,
+					.frame_fmt = msg.frame_fmt,
+					.buffer_fmt = SOF_IPC_BUFFER_INTERLEAVED,
+					.rate = msg.rate,
+					.channels = (uint16_t)msg.channels,
+					.sample_valid_bytes = (msg.frame_fmt == SOF_IPC_FRAME_S16_LE) ? 2 : 4,
+					.sample_container_bytes = (msg.frame_fmt == SOF_IPC_FRAME_S16_LE) ? 2 : 4,
+					.host_period_bytes = 0,
+				},
+			};
+
+			ret = pipeline_params(p, snk, &params_snk);
+			if (ret < 0) {
+				ipc_cmd_err(&ipc_tr,
+					    "pipe_trigger: snk params ret %d",
+					    ret);
+				return ret;
+			}
+			ret = pipeline_prepare(p, snk);
+			if (ret < 0) {
+				ipc_cmd_err(&ipc_tr,
+					    "pipe_trigger: snk prepare ret %d",
+					    ret);
+				return ret;
+			}
 		}
+
+		ret = pipeline_trigger_run(p, snk, msg.cmd);
+		if (ret < 0)
+			ipc_cmd_err(&ipc_tr,
+				    "pipe_trigger: snk trigger ret %d",
+				    ret);
+
+		/* DIAG V6.0: per-cmd TCSR snapshots at handler exit
+		 * 0x7B0: TCSR after PRE_START handler (cmd=7)
+		 * 0x7B4: TCSR after START handler (cmd=1)
+		 * 0x7B8: TCSR after STOP handler (cmd=0)
+		 * 0x7BC: TCSR after PAUSE handler (cmd=2)
+		 * 0x7C0: counter PRE_START exits, 0x7C4: START exits
+		 */
+		{
+			volatile uint32_t *sai_base = (volatile uint32_t *)0x30c50000U;
+			static volatile uint32_t dbg_pre, dbg_start;
+			uint32_t tcsr = sai_base[0x00 / 4];
+			if (msg.cmd == 7) {
+				dbg_pre++;
+				mailbox_sw_reg_write(0x7B0, tcsr);
+				mailbox_sw_reg_write(0x7C0, dbg_pre);
+			} else if (msg.cmd == 1) {
+				dbg_start++;
+				mailbox_sw_reg_write(0x7B4, tcsr);
+				mailbox_sw_reg_write(0x7C4, dbg_start);
+			} else if (msg.cmd == 0) {
+				mailbox_sw_reg_write(0x7B8, tcsr);
+			} else if (msg.cmd == 2) {
+				mailbox_sw_reg_write(0x7BC, tcsr);
+			}
+		}
+
+		return ret;
 	}
-
-	return pipeline_trigger(p, anchor, msg.cmd);
 }
 
 static int ipc_glb_tplg_free(uint32_t header,

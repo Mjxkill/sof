@@ -727,17 +727,35 @@ int pipeline_trigger_run(struct pipeline *p, struct comp_dev *host, int cmd)
 		else if (ret == PPL_STATUS_PATH_STOP)
 			ret = 0;
 
+		/* DIAG V6.0: TCSR right after START walk completes */
+		{
+			volatile uint32_t *sai_base = (volatile uint32_t *)0x30c50000U;
+			mailbox_sw_reg_write(0x7C8, sai_base[0]);  /* TCSR after START walk */
+		}
+
 		if (pipeline_is_timer_driven(p))
 			return ret;
 	}
 
 out:
+	/* DIAG V6.0: TCSR right before pipeline_schedule_triggered */
+	{
+		volatile uint32_t *sai_base = (volatile uint32_t *)0x30c50000U;
+		mailbox_sw_reg_write(0x7CC, sai_base[0]);  /* TCSR before sched_triggered */
+	}
+
 	/*
 	 * When called from the pipeline task, pipeline_comp_trigger() will not
 	 * add pipelines to the list, so pipeline_schedule_triggered() will have
 	 * no effect.
 	 */
 	pipeline_schedule_triggered(&walk_ctx, cmd);
+
+	/* DIAG V6.0: TCSR right after pipeline_schedule_triggered */
+	{
+		volatile uint32_t *sai_base = (volatile uint32_t *)0x30c50000U;
+		mailbox_sw_reg_write(0x7D0, sai_base[0]);  /* TCSR after sched_triggered */
+	}
 
 	return ret;
 }
