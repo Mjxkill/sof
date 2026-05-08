@@ -1463,30 +1463,28 @@ static int ipc_glb_tplg_pipe_trigger(uint32_t header)
 	 * each dai_common_params() call.
 	 */
 	{
+		struct comp_dev *src = p->source_comp;
 		struct comp_dev *snk = p->sink_comp;
+		int dir_src = src ? src->direction : 0;
 		int dir_snk = snk ? snk->direction : 0;
 
-		/* V6.0 minimal: trigger ONLY the TX (sink, master) DAI to
-		 * validate basic infrastructure. Once TX activates BCLK,
-		 * subsequent iteration will add RX (source, slave) trigger.
-		 */
-		if (!snk) {
+		if (!src && !snk) {
 			ipc_cmd_err(&ipc_tr,
-				    "pipe_trigger: pipeline %u no sink_comp",
+				    "pipe_trigger: pipeline %u no anchor",
 				    msg.pipeline_id);
 			return -EINVAL;
 		}
 
 		if (msg.cmd == COMP_TRIGGER_PRE_START) {
-			struct sof_ipc_pcm_params params_snk = {
+			struct sof_ipc_pcm_params params_src = {
 				.hdr = {
-					.size = sizeof(params_snk),
+					.size = sizeof(params_src),
 					.cmd = SOF_IPC_GLB_STREAM_MSG | SOF_IPC_STREAM_PCM_PARAMS,
 				},
-				.comp_id = snk->ipc_config.id,
+				.comp_id = src ? src->ipc_config.id : 0,
 				.params = {
-					.hdr = { .size = sizeof(params_snk.params) },
-					.direction = dir_snk,
+					.hdr = { .size = sizeof(params_src.params) },
+					.direction = dir_src,
 					.frame_fmt = msg.frame_fmt,
 					.buffer_fmt = SOF_IPC_BUFFER_INTERLEAVED,
 					.rate = msg.rate,
@@ -1496,28 +1494,74 @@ static int ipc_glb_tplg_pipe_trigger(uint32_t header)
 					.host_period_bytes = 0,
 				},
 			};
+			struct sof_ipc_pcm_params params_snk = params_src;
 
-			ret = pipeline_params(p, snk, &params_snk);
-			if (ret < 0) {
-				ipc_cmd_err(&ipc_tr,
-					    "pipe_trigger: snk params ret %d",
-					    ret);
-				return ret;
+			params_snk.comp_id = snk ? snk->ipc_config.id : 0;
+			params_snk.params.direction = dir_snk;
+
+			if (src) {
+				ret = pipeline_params(p, src, &params_src);
+				if (ret < 0) {
+					ipc_cmd_err(&ipc_tr,
+						    "pipe_trigger: src params ret %d",
+						    ret);
+					return ret;
+				}
+				ret = pipeline_prepare(p, src);
+				if (ret < 0) {
+					ipc_cmd_err(&ipc_tr,
+						    "pipe_trigger: src prepare ret %d",
+						    ret);
+					return ret;
+				}
 			}
-			ret = pipeline_prepare(p, snk);
+			if (snk && snk != src) {
+				ret = pipeline_params(p, snk, &params_snk);
+				if (ret < 0) {
+					ipc_cmd_err(&ipc_tr,
+						    "pipe_trigger: snk params ret %d",
+						    ret);
+					return ret;
+				}
+				ret = pipeline_prepare(p, snk);
+				if (ret < 0) {
+					ipc_cmd_err(&ipc_tr,
+						    "pipe_trigger: snk prepare ret %d",
+						    ret);
+					return ret;
+				}
+			}
+		}
+
+		/* Trigger order: SRC (RX, slave) FIRST, then SNK (TX, master).
+		 * Hardware: TX clock is continuous (sai_set_config IDEMPOTENCE
+		 * keeps TERE+TRCE permanently set; BCLK/FSYNC always running
+		 * for codec PLL stability). TX BCLK/FSYNC are physically wired
+		 * to RX clock inputs. So enabling RX (FRDE+dma_start) needs
+		 * no clocks-up wait — clocks are there. Then TX must start
+		 * AFTER B0 has data from RX, otherwise TX FIFO underflows
+		 * and SAI hardware auto-disables TE/BCE/FRDE on FEF assertion.
+		 */
+		ret = 0;
+		if (src) {
+			ret = pipeline_trigger_run(p, src, msg.cmd);
 			if (ret < 0) {
 				ipc_cmd_err(&ipc_tr,
-					    "pipe_trigger: snk prepare ret %d",
+					    "pipe_trigger: src trigger ret %d",
 					    ret);
 				return ret;
 			}
 		}
-
-		ret = pipeline_trigger_run(p, snk, msg.cmd);
-		if (ret < 0)
-			ipc_cmd_err(&ipc_tr,
-				    "pipe_trigger: snk trigger ret %d",
-				    ret);
+		if (snk && snk != src) {
+			int ret_snk = pipeline_trigger_run(p, snk, msg.cmd);
+			if (ret_snk < 0) {
+				ipc_cmd_err(&ipc_tr,
+					    "pipe_trigger: snk trigger ret %d",
+					    ret_snk);
+				if (ret >= 0)
+					ret = ret_snk;
+			}
+		}
 
 		/* DIAG V6.0: per-cmd TCSR snapshots at handler exit
 		 * 0x7B0: TCSR after PRE_START handler (cmd=7)
