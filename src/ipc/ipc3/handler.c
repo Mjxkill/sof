@@ -32,6 +32,7 @@
 #include <sof/lib/pm_runtime.h>
 #include <sof/list.h>
 #include <sof/platform.h>
+#include <platform/lib/memory.h>
 #include <rtos/string.h>
 #include <rtos/string_macro.h>
 #include <sof/trace/dma-trace.h>
@@ -1563,25 +1564,34 @@ static int ipc_glb_tplg_pipe_trigger(uint32_t header)
 			}
 		}
 
-		/* DIAG V6.0: per-cmd TCSR snapshots at handler exit
+		/* DIAG V6.0: per-cmd TCSR + RCSR snapshots at handler exit
+		 * Reads from SAI_7_BASE (0x30c80000) — the SAI feeding TAC5212.
+		 * Earlier code used 0x30c50000 which is SAI_5_BASE (unused on
+		 * this board) and produced bogus values that misled diagnosis.
+		 *
 		 * 0x7B0: TCSR after PRE_START handler (cmd=7)
 		 * 0x7B4: TCSR after START handler (cmd=1)
 		 * 0x7B8: TCSR after STOP handler (cmd=0)
 		 * 0x7BC: TCSR after PAUSE handler (cmd=2)
 		 * 0x7C0: counter PRE_START exits, 0x7C4: START exits
+		 * 0x484: RCSR after PRE_START handler
+		 * 0x470: RCSR after START handler
 		 */
 		{
-			volatile uint32_t *sai_base = (volatile uint32_t *)0x30c50000U;
+			volatile uint32_t *sai_base = (volatile uint32_t *)SAI_7_BASE;
 			static volatile uint32_t dbg_pre, dbg_start;
 			uint32_t tcsr = sai_base[0x00 / 4];
+			uint32_t rcsr = sai_base[0x80 / 4];
 			if (msg.cmd == 7) {
 				dbg_pre++;
 				mailbox_sw_reg_write(0x7B0, tcsr);
 				mailbox_sw_reg_write(0x7C0, dbg_pre);
+				mailbox_sw_reg_write(0x484, rcsr);
 			} else if (msg.cmd == 1) {
 				dbg_start++;
 				mailbox_sw_reg_write(0x7B4, tcsr);
 				mailbox_sw_reg_write(0x7C4, dbg_start);
+				mailbox_sw_reg_write(0x470, rcsr);
 			} else if (msg.cmd == 0) {
 				mailbox_sw_reg_write(0x7B8, tcsr);
 			} else if (msg.cmd == 2) {

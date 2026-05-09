@@ -20,6 +20,7 @@
 #include <rtos/kernel.h>
 #include <sof/audio/module_adapter/module/generic.h>
 #include <sof/lib/cpu-clk-manager.h>
+#include <platform/lib/memory.h>
 
 #include <errno.h>
 #include <stdbool.h>
@@ -729,7 +730,7 @@ int pipeline_trigger_run(struct pipeline *p, struct comp_dev *host, int cmd)
 
 		/* DIAG V6.0: TCSR right after START walk completes */
 		{
-			volatile uint32_t *sai_base = (volatile uint32_t *)0x30c50000U;
+			volatile uint32_t *sai_base = (volatile uint32_t *)SAI_7_BASE;
 			mailbox_sw_reg_write(0x7C8, sai_base[0]);  /* TCSR after START walk */
 		}
 
@@ -740,7 +741,7 @@ int pipeline_trigger_run(struct pipeline *p, struct comp_dev *host, int cmd)
 out:
 	/* DIAG V6.0: TCSR right before pipeline_schedule_triggered */
 	{
-		volatile uint32_t *sai_base = (volatile uint32_t *)0x30c50000U;
+		volatile uint32_t *sai_base = (volatile uint32_t *)SAI_7_BASE;
 		mailbox_sw_reg_write(0x7CC, sai_base[0]);  /* TCSR before sched_triggered */
 	}
 
@@ -753,7 +754,7 @@ out:
 
 	/* DIAG V6.0: TCSR right after pipeline_schedule_triggered */
 	{
-		volatile uint32_t *sai_base = (volatile uint32_t *)0x30c50000U;
+		volatile uint32_t *sai_base = (volatile uint32_t *)SAI_7_BASE;
 		mailbox_sw_reg_write(0x7D0, sai_base[0]);  /* TCSR after sched_triggered */
 	}
 
