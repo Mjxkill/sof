@@ -1516,6 +1516,23 @@ static int ipc_glb_tplg_pipe_trigger(uint32_t header)
 			params_snk.comp_id = snk ? snk->ipc_config.id : 0;
 			params_snk.params.direction = dir_snk;
 
+			/* V6.0 Fix H1: pipeline_comp_params unconditionally
+			 * writes current->direction = params->direction for
+			 * every comp visited by the walk. With 3 W_PIPELINEs
+			 * sharing pipeline_id=1, comp_is_single_pipeline()
+			 * returns TRUE for all components, so the walk crosses
+			 * both DAIs and overwrites their direction.
+			 *
+			 * Save direction BEFORE the params/prepare sequence,
+			 * restore it AFTER each params call (and once at the
+			 * end). pipeline_prepare itself does not overwrite
+			 * direction (verified in pipeline-params.c:285), but
+			 * pipeline_prepare(p, dev) starts its walk with
+			 * dev->direction at line 335, so the direction must be
+			 * correct between params and prepare.
+			 *
+			 * Diag mailbox 0x4B0-0x4BF tracks the values.
+			 */
 			if (src) {
 				ret = pipeline_params(p, src, &params_src);
 				if (ret < 0) {
@@ -1524,6 +1541,13 @@ static int ipc_glb_tplg_pipe_trigger(uint32_t header)
 						    ret);
 					return ret;
 				}
+				/* Restore direction immediately after params */
+				src->direction = dir_src;
+				if (snk)
+					snk->direction = dir_snk;
+				mailbox_sw_reg_write(0x4B0, (uint32_t)src->direction);
+				mailbox_sw_reg_write(0x4B4, snk ? (uint32_t)snk->direction : 0xFFFFFFFFu);
+
 				ret = pipeline_prepare(p, src);
 				if (ret < 0) {
 					ipc_cmd_err(&ipc_tr,
@@ -1540,6 +1564,13 @@ static int ipc_glb_tplg_pipe_trigger(uint32_t header)
 						    ret);
 					return ret;
 				}
+				/* Restore again after snk params */
+				if (src)
+					src->direction = dir_src;
+				snk->direction = dir_snk;
+				mailbox_sw_reg_write(0x4B8, src ? (uint32_t)src->direction : 0xFFFFFFFFu);
+				mailbox_sw_reg_write(0x4BC, (uint32_t)snk->direction);
+
 				ret = pipeline_prepare(p, snk);
 				if (ret < 0) {
 					ipc_cmd_err(&ipc_tr,

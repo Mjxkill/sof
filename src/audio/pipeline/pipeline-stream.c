@@ -736,6 +736,28 @@ int pipeline_trigger_run(struct pipeline *p, struct comp_dev *host, int cmd)
 
 		if (pipeline_is_timer_driven(p))
 			return ret;
+
+		/* V6.0 Fix H2: NO_HOST/ALWAYS_ON DAI-to-DAI pipelines are
+		 * driven by the SAI/SDMA IRQs themselves, not by the LL_DMA
+		 * scheduler. Going through pipeline_schedule_triggered() →
+		 * schedule_task() → schedule_ll_domain_set() →
+		 * dma_single_chan_domain_register() under irq_local_disable
+		 * causes a deadlock: interrupt_register / notifier_register
+		 * cannot acquire their own locks while the parent IRQ is
+		 * disabled and a spinlock is held.
+		 *
+		 * Skip pipeline_schedule_triggered for these pipelines. The
+		 * DAI components have already been transitioned to ACTIVE by
+		 * the walk above; subsequent data flow is autonomous via DMA
+		 * callbacks (dai_dma_cb hooks).
+		 *
+		 * Diag 0x4A8 marker B2 in the F4 handler now becomes
+		 * reachable, confirming pipeline_trigger_run returns
+		 * normally for both src and snk.
+		 */
+		if (p->attributes &
+		    (PIPELINE_ATTR_NO_HOST | PIPELINE_ATTR_ALWAYS_ON))
+			return ret;
 	}
 
 out:
