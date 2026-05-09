@@ -1469,6 +1469,22 @@ static int ipc_glb_tplg_pipe_trigger(uint32_t header)
 		int dir_src = src ? src->direction : 0;
 		int dir_snk = snk ? snk->direction : 0;
 
+		/* DIAG V6.0: dump anchors to mailbox so we can tell whether
+		 * src/snk are NULL, equal, or properly distinct. Plage V6.0
+		 * 0x488-0x4AC (in the 0x470-0x4FF reserved zone).
+		 *   0x488: src->ipc_config.id (0xFFFFFFFF if NULL)
+		 *   0x48C: snk->ipc_config.id (0xFFFFFFFF if NULL)
+		 *   0x490: 1 if src==snk (and both non-NULL), else 0
+		 *   0x494: msg.cmd (PRE_START=7, START=1, STOP=0, PAUSE=2)
+		 */
+		mailbox_sw_reg_write(0x488,
+			src ? (uint32_t)src->ipc_config.id : 0xFFFFFFFFu);
+		mailbox_sw_reg_write(0x48C,
+			snk ? (uint32_t)snk->ipc_config.id : 0xFFFFFFFFu);
+		mailbox_sw_reg_write(0x490,
+			(src && snk && src == snk) ? 1u : 0u);
+		mailbox_sw_reg_write(0x494, (uint32_t)msg.cmd);
+
 		if (!src && !snk) {
 			ipc_cmd_err(&ipc_tr,
 				    "pipe_trigger: pipeline %u no anchor",
@@ -1544,8 +1560,21 @@ static int ipc_glb_tplg_pipe_trigger(uint32_t header)
 		 * and SAI hardware auto-disables TE/BCE/FRDE on FEF assertion.
 		 */
 		ret = 0;
+		/* DIAG V6.0: progress markers around the two trigger_run calls
+		 *   0x498: 0xA1 = entering src trigger_run
+		 *   0x49C: 0xA2 = returned from src trigger_run
+		 *   0x4A0: ret of src trigger_run (0xFFFFFFFF if src was NULL)
+		 *   0x4A4: 0xB1 = entering snk trigger_run
+		 *   0x4A8: 0xB2 = returned from snk trigger_run
+		 *   0x4AC: ret of snk trigger_run (0xFFFFFFFF if snk was skipped)
+		 */
+		mailbox_sw_reg_write(0x4A0, 0xFFFFFFFFu);
+		mailbox_sw_reg_write(0x4AC, 0xFFFFFFFFu);
 		if (src) {
+			mailbox_sw_reg_write(0x498, 0xA1u);
 			ret = pipeline_trigger_run(p, src, msg.cmd);
+			mailbox_sw_reg_write(0x49C, 0xA2u);
+			mailbox_sw_reg_write(0x4A0, (uint32_t)ret);
 			if (ret < 0) {
 				ipc_cmd_err(&ipc_tr,
 					    "pipe_trigger: src trigger ret %d",
@@ -1554,7 +1583,10 @@ static int ipc_glb_tplg_pipe_trigger(uint32_t header)
 			}
 		}
 		if (snk && snk != src) {
+			mailbox_sw_reg_write(0x4A4, 0xB1u);
 			int ret_snk = pipeline_trigger_run(p, snk, msg.cmd);
+			mailbox_sw_reg_write(0x4A8, 0xB2u);
+			mailbox_sw_reg_write(0x4AC, (uint32_t)ret_snk);
 			if (ret_snk < 0) {
 				ipc_cmd_err(&ipc_tr,
 					    "pipe_trigger: snk trigger ret %d",
