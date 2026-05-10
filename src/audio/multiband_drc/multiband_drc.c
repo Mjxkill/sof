@@ -125,6 +125,29 @@ static int multiband_drc_init_coef(struct processing_module *mod, int16_t nch, u
 		return -EINVAL;
 	}
 
+	/* V7.0-E2 : compute params_per_band from blob size.
+	 * trailing_bytes = total - fixed_header. Must be divisible by
+	 * (num_bands * sizeof(sof_drc_params)) ; quotient = params_per_band.
+	 * params_per_band == 1 => legacy ; > 1 => per-channel-per-band (V7.0).
+	 */
+	{
+		size_t trailing = config->size - SOF_MULTIBAND_DRC_HEADER_FIXED_SIZE;
+		size_t one_band = num_bands * sizeof(struct sof_drc_params);
+
+		if (one_band == 0 || (trailing % one_band) != 0) {
+			comp_err(dev,
+				 "multiband_drc_init_coef(), bad blob size %u — trailing %zu not multiple of %zu (legacy fallback)",
+				 config->size, trailing, one_band);
+			cd->params_per_band = 1;
+		} else {
+			cd->params_per_band = (uint32_t)(trailing / one_band);
+		}
+		comp_info(dev,
+			  "multiband_drc_init_coef(), %s params_per_band=%u (num_bands=%i nch=%i)",
+			  cd->params_per_band == 1 ? "legacy" : "V7.0 per-channel",
+			  cd->params_per_band, num_bands, nch);
+	}
+
 	comp_info(dev, "multiband_drc_init_coef(), initializing %i-way crossover",
 		  config->num_bands);
 
@@ -180,8 +203,13 @@ static int multiband_drc_init_coef(struct processing_module *mod, int16_t nch, u
 			goto err;
 		}
 
+		/* pre_delay_time : taken from ch=0 of band i (V7.0-E2 multi-config
+		 * still uses a single pre-delay per band — must be identical for
+		 * all channels to keep the inter-channel time alignment).
+		 */
 		ret = drc_set_pre_delay_time(&state->drc[i],
-					     cd->config->drc_coef[i].pre_delay_time, rate);
+					     cd->config->drc_coef[i * cd->params_per_band].pre_delay_time,
+					     rate);
 		if (ret < 0) {
 			comp_err(dev, "multiband_drc_init_coef(), could not set pre delay time");
 			goto err;

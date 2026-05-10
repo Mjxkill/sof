@@ -8,6 +8,7 @@
 #ifndef __USER_MULTIBAND_DRC_H__
 #define __USER_MULTIBAND_DRC_H__
 
+#include <stddef.h>
 #include <stdint.h>
 #include <user/eq.h>
 #include <module/crossover/crossover_common.h>
@@ -23,8 +24,12 @@
 /* The number of biquads (and biquads in series) of (De)Emphasis Equalizer */
 #define SOF_EMP_DEEMP_BIQUADS 2
 
-/* Maximum number allowed of IPC configuration blob size */
-#define SOF_MULTIBAND_DRC_MAX_BLOB_SIZE 1024
+/* Maximum number allowed of IPC configuration blob size.
+ * Bumped to 2048 in V7.0-E2 to fit per-channel-per-band drc params blobs :
+ * (4 bands × 8 ch × ~40 B per sof_drc_params) ≈ 1280 B + ~124 B header.
+ * Old limit 1024 B kept legacy single-config (4 bands × 1 ch ≈ 160 B).
+ */
+#define SOF_MULTIBAND_DRC_MAX_BLOB_SIZE 2048
 
  /* multiband_drc configuration
   *     Multiband DRC is a single-source-single-sink compound component which
@@ -57,11 +62,25 @@
   *         The coefficient data for Crossover LR4 filters. Please refer
   *         src/include/user/crossover.h for details. Zeros will be filled if
   *         the entries are useless. For example, when 2-way crossover is used:
-  *     struct sof_drc_params drc_coef[num_bands]
-  *         The parameter data for DRC per band, the number entries of this may
-  *         vary. Please refer src/include/user/drc.h for details.
+  *     struct sof_drc_params drc_coef[num_bands * params_per_band]
+  *         The parameter data for DRC per band. Layout :
+  *           drc_coef[0..num_bands-1]                       — band 0..N-1 with
+  *               single set of params (legacy, params_per_band = 1)
+  *           drc_coef[band * params_per_band + ch]          — band-channel
+  *               specific params (V7.0-E2 extended, params_per_band > 1).
+  *         Detection : the firmware reads (size - sizeof(fixed_header)) and
+  *         derives params_per_band = trailing_bytes / (num_bands * sizeof(sof_drc_params)).
+  *         params_per_band == 1 keeps legacy behaviour (one params shared
+  *         by all channels of the band — existing topologies continue to work).
+  *         params_per_band > 1 (typically num_channels) reads N consecutive
+  *         sof_drc_params per band ; channel ch uses entry[ch] if ch <
+  *         params_per_band, else clamps to entry[params_per_band-1].
   *
   */
+#define SOF_MULTIBAND_DRC_HEADER_FIXED_SIZE \
+	(offsetof(struct sof_multiband_drc_config, drc_coef))
+
+
 struct sof_multiband_drc_config {
 	uint32_t size;
 	uint32_t num_bands;

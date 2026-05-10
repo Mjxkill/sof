@@ -31,9 +31,9 @@ include(`sof/tokens.m4')
 include(`platform/imx/imx8.m4')
 
 #
-# PIPE 1 : capture 8ch — eq_iir + drc(D3 multi-config) + pga (E6.a inchangé)
+# PIPE 1 : capture 8ch — multiband_drc + drc(D3 multi-config) + pga (V7.0-E2)
 #
-PIPELINE_PCM_ADD(sof/pipe-eq-drc-pga-8ch-D3-capture.m4,
+PIPELINE_PCM_ADD(sof/pipe-multiband-drc-pga-8ch-capture.m4,
 	1, 0, 8, s32le,
 	2000, 0, 0,
 	48000, 48000, 48000,

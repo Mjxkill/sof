@@ -43,6 +43,11 @@ struct multiband_drc_comp_data {
 	bool process_enabled;                    /**< true if component is enabled */
 	multiband_drc_func multiband_drc_func;   /**< processing function */
 	crossover_split crossover_split;         /**< crossover n-way split func */
+	uint32_t params_per_band;                /**< 1 = legacy single-config per band,
+						   *   N = N distinct sof_drc_params per band
+						   *   (typically N = num_channels for V7.0-E2).
+						   *   Computed at config load from blob size.
+						   */
 };
 
 struct multiband_drc_proc_fnmap {

@@ -56,8 +56,15 @@ static void multiband_drc_process_emp_crossover(struct multiband_drc_state *stat
 }
 
 #if CONFIG_FORMAT_S16LE
+/* V7.0-E2 : p_band_base points at drc_coef[band * params_per_band] ;
+ * channel ch picks p_band_base[ch < params_per_band ? ch : params_per_band - 1].
+ * params_per_band == 1 falls back to legacy (one params shared across nch).
+ */
+#define DRC_PARAM_FOR_CH(base, pbb, ch) (&(base)[(ch) < (pbb) ? (ch) : (pbb) - 1])
+
 static void multiband_drc_s16_process_drc(struct drc_state *state,
-					  const struct sof_drc_params *p,
+					  const struct sof_drc_params *p_band_base,
+					  uint32_t params_per_band,
 					  int32_t *buf_src,
 					  int32_t *buf_sink,
 					  int nch)
@@ -67,9 +74,11 @@ static void multiband_drc_s16_process_drc(struct drc_state *state,
 	int ch;
 	int pd_write_index;
 	int pd_read_index;
+	const struct sof_drc_params *p;
 
-	if (p->enabled && !state->processed) {
+	if (p_band_base[0].enabled && !state->processed) {
 		for (ch = 0; ch < nch; ++ch) {
+			p = DRC_PARAM_FOR_CH(p_band_base, params_per_band, ch);
 			drc_update_envelope(state, p, ch);
 			drc_compress_output(state, p, 2, ch);
 		}
@@ -94,13 +103,14 @@ static void multiband_drc_s16_process_drc(struct drc_state *state,
 	state->pre_delay_write_index = pd_write_index;
 	state->pre_delay_read_index = pd_read_index;
 
-	/* Only perform delay frames by early return here if not enabled */
-	if (!p->enabled)
+	/* enabled flag treated as band-global (taken from ch 0). */
+	if (!p_band_base[0].enabled)
 		return;
 
 	/* Process the input division (32 frames) per channel. */
 	if (!(pd_write_index & DRC_DIVISION_FRAMES_MASK)) {
 		for (ch = 0; ch < nch; ++ch) {
+			p = DRC_PARAM_FOR_CH(p_band_base, params_per_band, ch);
 			drc_update_detector_average(state, p, 2, ch);
 			drc_update_envelope(state, p, ch);
 			drc_compress_output(state, p, 2, ch);
@@ -111,7 +121,8 @@ static void multiband_drc_s16_process_drc(struct drc_state *state,
 
 #if CONFIG_FORMAT_S24LE || CONFIG_FORMAT_S32LE
 static void multiband_drc_s32_process_drc(struct drc_state *state,
-					  const struct sof_drc_params *p,
+					  const struct sof_drc_params *p_band_base,
+					  uint32_t params_per_band,
 					  int32_t *buf_src,
 					  int32_t *buf_sink,
 					  int nch)
@@ -121,9 +132,11 @@ static void multiband_drc_s32_process_drc(struct drc_state *state,
 	int ch;
 	int pd_write_index;
 	int pd_read_index;
+	const struct sof_drc_params *p;
 
-	if (p->enabled && !state->processed) {
+	if (p_band_base[0].enabled && !state->processed) {
 		for (ch = 0; ch < nch; ++ch) {
+			p = DRC_PARAM_FOR_CH(p_band_base, params_per_band, ch);
 			drc_update_envelope(state, p, ch);
 			drc_compress_output(state, p, 4, ch);
 		}
@@ -148,13 +161,14 @@ static void multiband_drc_s32_process_drc(struct drc_state *state,
 	state->pre_delay_write_index = pd_write_index;
 	state->pre_delay_read_index = pd_read_index;
 
-	/* Only perform delay frames by early return here if not enabled */
-	if (!p->enabled)
+	/* enabled flag treated as band-global (taken from ch 0). */
+	if (!p_band_base[0].enabled)
 		return;
 
 	/* Process the input division (32 frames) per channel. */
 	if (!(pd_write_index & DRC_DIVISION_FRAMES_MASK)) {
 		for (ch = 0; ch < nch; ++ch) {
+			p = DRC_PARAM_FOR_CH(p_band_base, params_per_band, ch);
 			drc_update_detector_average(state, p, 4, ch);
 			drc_update_envelope(state, p, ch);
 			drc_compress_output(state, p, 4, ch);
@@ -255,7 +269,8 @@ static void multiband_drc_s16_default(const struct processing_module *mod,
 			band_buf_drc_sink = buf_drc_sink;
 			for (band = 0; band < nband; ++band) {
 				multiband_drc_s16_process_drc(&state->drc[band],
-							      &cd->config->drc_coef[band],
+							      &cd->config->drc_coef[band * cd->params_per_band],
+							      cd->params_per_band,
 							      band_buf_drc_src, band_buf_drc_sink,
 							      nch);
 				band_buf_drc_src += PLATFORM_MAX_CHANNELS;
@@ -322,7 +337,8 @@ static void multiband_drc_s24_default(const struct processing_module *mod,
 			band_buf_drc_sink = buf_drc_sink;
 			for (band = 0; band < nband; ++band) {
 				multiband_drc_s32_process_drc(&state->drc[band],
-							      &cd->config->drc_coef[band],
+							      &cd->config->drc_coef[band * cd->params_per_band],
+							      cd->params_per_band,
 							      band_buf_drc_src, band_buf_drc_sink,
 							      nch);
 				band_buf_drc_src += PLATFORM_MAX_CHANNELS;
@@ -389,7 +405,8 @@ static void multiband_drc_s32_default(const struct processing_module *mod,
 			band_buf_drc_sink = buf_drc_sink;
 			for (band = 0; band < nband; ++band) {
 				multiband_drc_s32_process_drc(&state->drc[band],
-							      &cd->config->drc_coef[band],
+							      &cd->config->drc_coef[band * cd->params_per_band],
+							      cd->params_per_band,
 							      band_buf_drc_src, band_buf_drc_sink,
 							      nch);
 				band_buf_drc_src += PLATFORM_MAX_CHANNELS;
