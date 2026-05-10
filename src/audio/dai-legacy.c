@@ -306,6 +306,16 @@ int dai_common_new(struct dai_data *dd, struct comp_dev *dev, const struct ipc_c
 	dd->dai->dd = dd;
 	dd->ipc_config = *dai;
 
+	/* V6.0 NO_HOST fix: propagate per-DAI direction (from W_DAI_IN /
+	 * W_DAI_OUT SOF_TKN_DAI_DIRECTION) into comp_dev so that always-on
+	 * pipelines that skip PCM_PARAMS still see the correct direction
+	 * at trigger time. For HOST-driven flows, pipeline_comp_params will
+	 * overwrite this with the same value carried by PCM_PARAMS — net
+	 * zero effect (no regression). Aligns IPC3 with IPC4 helper.c:830.
+	 */
+	dev->direction = dai->direction;
+	dev->direction_set = true;
+
 	/* request GP LP DMA with shared access privilege */
 	dir = dai->direction == SOF_IPC_STREAM_PLAYBACK ?
 			DMA_DIR_MEM_TO_DEV : DMA_DIR_DEV_TO_MEM;
