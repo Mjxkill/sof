@@ -868,6 +868,35 @@ static int sdma_read_config(struct dma_chan_data *channel,
 		return -EINVAL;
 	}
 
+	/* DIAG V6.0: per-channel mapping (no last-write-wins, indexed by
+	 * channel->index). Slots dédiés en SRAM_DEBUG plage 0x500-0x56F :
+	 *   0x500          : marker = 0xCAFE0420 (block ran at least once)
+	 *   0x504          : global counter of sdma_set_config calls
+	 *   0x510 + i*4    : pdata->sdma_chan_type for channel i (0-7)
+	 *                      AP2AP=0, AP2MCU=1, MCU2AP=2, SHP2MCU=3,
+	 *                      MCU2SHP=4, SAI2MCU=5
+	 *   0x530 + i*4    : pdata->hw_event (handshake; -1 = 0xFFFFFFFF
+	 *                      for AP2AP since software-triggered)
+	 *   0x550 + i*4    : config->direction (MEM_TO_DEV/DEV_TO_MEM/MEM_TO_MEM)
+	 * Slots restants à 0xFFFFFFFF (init mailbox) = channel jamais
+	 * passé par sdma_set_config dans cette session. (0x570/0x574 réservés
+	 * pour pipeline_task counters et NON touchés.)
+	 */
+	{
+		static volatile uint32_t dbg_set_cfg_calls;
+		dbg_set_cfg_calls++;
+		mailbox_sw_reg_write(0x500, 0xCAFE0420u);
+		mailbox_sw_reg_write(0x504, dbg_set_cfg_calls);
+		if (channel->index < 8) {
+			mailbox_sw_reg_write(0x510 + channel->index * 4,
+					     (uint32_t)pdata->sdma_chan_type);
+			mailbox_sw_reg_write(0x530 + channel->index * 4,
+					     (uint32_t)pdata->hw_event);
+			mailbox_sw_reg_write(0x550 + channel->index * 4,
+					     (uint32_t)config->direction);
+		}
+	}
+
 	for (i = 0; i < config->elem_array.count; i++) {
 		if (config->direction == DMA_DIR_MEM_TO_DEV &&
 		    pdata->fifo_paddr != config->elem_array.elems[i].dest) {
