@@ -737,27 +737,23 @@ int pipeline_trigger_run(struct pipeline *p, struct comp_dev *host, int cmd)
 		if (pipeline_is_timer_driven(p))
 			return ret;
 
-		/* V6.0 Fix H2: NO_HOST/ALWAYS_ON DAI-to-DAI pipelines are
-		 * driven by the SAI/SDMA IRQs themselves, not by the LL_DMA
-		 * scheduler. Going through pipeline_schedule_triggered() →
-		 * schedule_task() → schedule_ll_domain_set() →
-		 * dma_single_chan_domain_register() under irq_local_disable
-		 * causes a deadlock: interrupt_register / notifier_register
-		 * cannot acquire their own locks while the parent IRQ is
-		 * disabled and a spinlock is held.
+		/* V6.0 DIAG TEMPORAIRE: Fix B (early return NO_HOST) commenté
+		 * pour atteindre pipeline_schedule_triggered() et identifier
+		 * précisément où le hang historique se produisait. Marker
+		 * 0x4F0=0xCC confirme que le code traverse cette zone.
 		 *
-		 * Skip pipeline_schedule_triggered for these pipelines. The
-		 * DAI components have already been transitioned to ACTIVE by
-		 * the walk above; subsequent data flow is autonomous via DMA
-		 * callbacks (dai_dma_cb hooks).
+		 * Si la board hang à nouveau : marker 0x4C0 (entry de
+		 * pipeline_schedule_triggered) + suivants permettent de
+		 * localiser le point exact dans la mailbox SRAM.
 		 *
-		 * Diag 0x4A8 marker B2 in the F4 handler now becomes
-		 * reachable, confirming pipeline_trigger_run returns
-		 * normally for both src and snk.
+		 * Une fois la cause comprise : appliquer un fix ciblé et
+		 * supprimer ces diags.
 		 */
-		if (p->attributes &
-		    (PIPELINE_ATTR_NO_HOST | PIPELINE_ATTR_ALWAYS_ON))
-			return ret;
+		mailbox_sw_reg_write(0x4F0, 0xCCu);
+		/* if (p->attributes &
+		 *     (PIPELINE_ATTR_NO_HOST | PIPELINE_ATTR_ALWAYS_ON))
+		 *	return ret;
+		 */
 	}
 
 out:

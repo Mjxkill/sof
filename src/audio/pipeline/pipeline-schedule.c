@@ -300,6 +300,21 @@ void pipeline_schedule_triggered(struct pipeline_walk_context *ctx,
 	struct list_item *tlist;
 	struct pipeline *p;
 	uint32_t flags;
+	/* DIAG V6.0: granular markers to locate hang inside this function.
+	 * Plage V6.0 reserved 0x4C0-0x4E4 (in 0x470-0x4FF clean zone).
+	 *   0x4C0: entry marker (function reached)
+	 *   0x4C4: after irq_local_disable
+	 *   0x4C8: entry into PRE_START switch case
+	 *   0x4CC: list_for_item iteration count
+	 *   0x4D0: last p->pipeline_id seen in iteration
+	 *   0x4D4: marker before pipeline_schedule_copy
+	 *   0x4D8: marker after pipeline_schedule_copy returns
+	 *   0x4DC: marker after for loop exits (break)
+	 *   0x4E0: marker before irq_local_enable
+	 *   0x4E4: exit marker (function returning)
+	 */
+	uint32_t loop_count = 0;
+	mailbox_sw_reg_write(0x4C0, 0xC0u);
 
 	/*
 	 * Interrupts have to be disabled while adding tasks to or removing them
@@ -307,6 +322,7 @@ void pipeline_schedule_triggered(struct pipeline_walk_context *ctx,
 	 * immediately before all pipelines achieved a consistent state.
 	 */
 	irq_local_disable(flags);
+	mailbox_sw_reg_write(0x4C4, 0xC4u);
 
 	switch (cmd) {
 	case COMP_TRIGGER_PAUSE:
@@ -332,8 +348,13 @@ void pipeline_schedule_triggered(struct pipeline_walk_context *ctx,
 		break;
 	case COMP_TRIGGER_PRE_RELEASE:
 	case COMP_TRIGGER_PRE_START:
+		mailbox_sw_reg_write(0x4C8, 0xC8u);
 		list_for_item(tlist, &ctx->pipelines) {
+			loop_count++;
+			mailbox_sw_reg_write(0x4CC, loop_count);
 			p = container_of(tlist, struct pipeline, list);
+			mailbox_sw_reg_write(0x4D0,
+					     (uint32_t)p->pipeline_id);
 			p->xrun_bytes = 0;
 			if (pipeline_is_timer_driven(p)) {
 				/*
@@ -348,8 +369,11 @@ void pipeline_schedule_triggered(struct pipeline_walk_context *ctx,
 			} else {
 				p->status = COMP_STATE_ACTIVE;
 			}
+			mailbox_sw_reg_write(0x4D4, 0xD4u);
 			pipeline_schedule_copy(p, 0);
+			mailbox_sw_reg_write(0x4D8, 0xD8u);
 		}
+		mailbox_sw_reg_write(0x4DC, 0xDCu);
 		break;
 	case COMP_TRIGGER_XRUN:
 		list_for_item(tlist, &ctx->pipelines) {
@@ -363,7 +387,9 @@ void pipeline_schedule_triggered(struct pipeline_walk_context *ctx,
 		}
 	}
 
+	mailbox_sw_reg_write(0x4E0, 0xE0u);
 	irq_local_enable(flags);
+	mailbox_sw_reg_write(0x4E4, 0xE4u);
 }
 
 int pipeline_comp_ll_task_init(struct pipeline *p)
