@@ -50,7 +50,7 @@ DAI_ADD(sof/pipe-dai-capture.m4,
 #
 # PIPE 2 : playback 8ch — strips OUT (multiband_drc -> pga -> drc-limiter) (V7.0-E3)
 #
-PIPELINE_PCM_ADD(sof/pipe-multiband-drc-pga-drc-8ch-playback.m4,
+PIPELINE_PCM_ADD(sof/pipe-multiband-pga-8ch-playback.m4,
 	2, 1, 8, s32le,
 	2000, 0, 0,
 	48000, 48000, 48000,
