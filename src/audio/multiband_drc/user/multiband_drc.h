@@ -25,11 +25,14 @@
 #define SOF_EMP_DEEMP_BIQUADS 2
 
 /* Maximum number allowed of IPC configuration blob size.
- * Bumped to 2048 in V7.0-E2 to fit per-channel-per-band drc params blobs :
- * (4 bands × 8 ch × ~40 B per sof_drc_params) ≈ 1280 B + ~124 B header.
- * Old limit 1024 B kept legacy single-config (4 bands × 1 ch ≈ 160 B).
+ * Bumped to 4096 in V7.0-E2 to fit per-channel-per-band drc params blobs :
+ *   header (size + bands + enable + reserved + emp + deemp + crossover) ≈ 244 B
+ *   drc_coef[num_bands × num_channels] = 4 × 8 × 88 B (sof_drc_params packed)
+ *                                      = 2816 B
+ *   total max ≈ 3060 B (4 bands × 8 ch).
+ * Old limit 1024 B kept legacy single-config (4 bands × 1 ch × 88 ≈ 352 B + 244 hdr).
  */
-#define SOF_MULTIBAND_DRC_MAX_BLOB_SIZE 2048
+#define SOF_MULTIBAND_DRC_MAX_BLOB_SIZE 4096
 
  /* multiband_drc configuration
   *     Multiband DRC is a single-source-single-sink compound component which

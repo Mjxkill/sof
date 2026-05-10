@@ -34,7 +34,7 @@ include(`pga.m4')
 # Coefs : multiband_drc default + drc default
 #
 
-ifdef(`PIPELINE_FILTER1', , `define(PIPELINE_FILTER1, multiband_drc_coef_default.m4)')
+ifdef(`PIPELINE_FILTER1', , `define(PIPELINE_FILTER1, multiband_drc_coef_default_8ch.m4)')
 include(PIPELINE_FILTER1)
 
 ifdef(`PIPELINE_DRC1', , `define(PIPELINE_DRC1, drc_coef_default_8ch.m4)')
@@ -55,7 +55,7 @@ C_CONTROLBYTES(MULTIBAND_DRC_8CH_CTRL, PIPELINE_ID,
 	, , ,
 	CONTROLBYTES_MAX(, 4096),
 	,
-	MULTIBAND_DRC_priv)
+	MULTIBAND_DRC_priv_8ch)
 
 # 1 DRC control (blob multi-config 8 DRC indép — D3 patch)
 C_CONTROLBYTES(DRC_8CH_CTRL, PIPELINE_ID,
