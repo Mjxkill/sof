@@ -46,10 +46,13 @@ DECLARE_SOF_RT_UUID("dai", dai_comp_uuid, 0xc2b00d27, 0xffbc, 0x4150,
 
 DECLARE_TR_CTX(dai_comp_tr, SOF_UUID(dai_comp_uuid), LOG_LEVEL_INFO);
 
-/* V3.2.2 NPU tap (R7) — mono-DAI ownership sentinel.
+/* V7.0-E4 NPU dual-tap (R7) — mono-DAI ownership sentinel par direction.
  * Single-core CONFIG_CORE_COUNT=1 → no atomic/spinlock required.
+ *   npu_tap_in_owner  : DAI capture qui détient le tap-in  (PIPE 1 cap)
+ *   npu_tap_out_owner : DAI playback qui détient le tap-out (PIPE 2 play)
  */
-struct dai_data *npu_tap_owner;
+struct dai_data *npu_tap_in_owner;
+struct dai_data *npu_tap_out_owner;
 
 #if CONFIG_COMP_DAI_GROUP
 
@@ -155,14 +158,20 @@ static void dai_dma_cb(void *arg, enum notify_id type, void *data)
 		dd->total_data_processed += bytes;
 
 		/*
-		 * V3.2.2 NPU tap : copie post-DRC du dma_buffer (OCRAM) vers
-		 * shared ring buffer (SDRAM @0x942B0000) pour analyse NPU A53.
-		 * Conditions A3+A6 : direction PLAYBACK, dma_buffer_copy_to OK,
-		 * tap_buffer non-NULL (R7 sentinelle peut le NULLifier),
-		 * bytes valide (A6 overflow guard via hdr->ring_size).
+		 * V7.0-E4 NPU dual-tap : copie le contenu du dma_buffer vers la
+		 * zone reserved-memory partagée pour analyse NPU A53.
+		 *   PLAYBACK → tap-out (post-effets, V3.2.2 alias)
+		 *              src = ce qui vient d'être ÉCRIT dans dd->dma_buffer
+		 *              par dma_buffer_copy_to (rewind wptr).
+		 *   CAPTURE  → tap-in (signal SAI RX brut, pre-DSP)
+		 *              src = ce qui vient d'être LU depuis dd->dma_buffer
+		 *              par dma_buffer_copy_from (rewind rptr — logique
+		 *              miroir de rewind_wptr_by_bytes, pas d'API SOF
+		 *              équivalente côté rptr).
+		 * Conditions A3+A6 : tap_buffer non-NULL (R7 sentinelle peut le
+		 * NULLifier), bytes <= ring_size (A6 overflow guard).
 		 */
-		if (dev->direction == SOF_IPC_STREAM_PLAYBACK &&
-		    dd->tap_buffer && bytes > 0) {
+		if (dd->tap_buffer && bytes > 0) {
 			struct npu_tap_hdr *hdr =
 				(struct npu_tap_hdr *)dd->tap_buffer;
 			uint8_t *data_base = (uint8_t *)dd->tap_buffer +
@@ -171,15 +180,31 @@ static void dai_dma_cb(void *arg, enum notify_id type, void *data)
 			uint32_t w = hdr->write_idx;
 
 			if (bytes <= ring_size) {		/* A6 guard */
-				/* A4 : back-walk to source start (post-produce) */
 				struct audio_stream *stream =
 					&dd->dma_buffer->stream;
-				void *src =
-					audio_stream_rewind_wptr_by_bytes(stream,
-									  bytes);
+				void *src;
+
+				if (dev->direction == SOF_IPC_STREAM_PLAYBACK) {
+					/* A4 playback : back-walk wptr (post-produce) */
+					src = audio_stream_rewind_wptr_by_bytes(
+						stream, bytes);
+				} else {
+					/* V7.0-E4 capture : back-walk rptr
+					 * (post-consume). Logique miroir de
+					 * audio_stream_rewind_wptr_by_bytes.
+					 */
+					void *rptr = audio_stream_get_rptr(stream);
+					int to_begin = (intptr_t)rptr -
+						       (intptr_t)stream->addr;
+					if (to_begin >= (int)bytes)
+						src = (uint8_t *)rptr - bytes;
+					else
+						src = (uint8_t *)stream->end_addr -
+						      (bytes - to_begin);
+				}
+
 				uint32_t src_to_end =
-					audio_stream_bytes_without_wrap(stream,
-									src);
+					audio_stream_bytes_without_wrap(stream, src);
 				uint32_t src_head = MIN(bytes, src_to_end);
 				uint32_t src_tail = bytes - src_head;
 				uint32_t tap_to_end = ring_size - w;
@@ -679,19 +704,35 @@ int dai_common_params(struct dai_data *dd, struct comp_dev *dev,
 	}
 
 	/*
-	 * V3.2.2 NPU tap init / reset header (R3 ordering canonique
+	 * V7.0-E4 NPU dual-tap init / reset header (R3 ordering canonique
 	 * data state FIRST, version PUBLISH LAST + M5 magic handshake).
-	 * R7 sentinelle mono-DAI : 1er DAI playback prend ownership.
+	 * R7 sentinelle mono-DAI par direction :
+	 *   - PLAYBACK : 1er DAI play prend ownership tap-out (alias V3.2.2)
+	 *   - CAPTURE  : 1er DAI cap  prend ownership tap-in
 	 *
 	 * Defensive : period_bytes==0 (cas pathologique) ⇒ skip tap init pour
 	 * éviter divide-by-zero dans (NPU_TAP_DATA_SIZE_MAX / period_bytes).
 	 * Normalement period_bytes > 0 (calculé depuis PCM hw_params), mais
 	 * protection en profondeur (issue critic_review turn 188 sev=medium).
 	 */
-	if (dev->direction == SOF_IPC_STREAM_PLAYBACK && period_bytes > 0) {
-		if (!npu_tap_owner) {
-			npu_tap_owner = dd;
-		} else if (npu_tap_owner != dd) {
+	if (period_bytes > 0) {
+		struct dai_data **owner_pp;
+		uintptr_t tap_phys;
+		uint32_t hdr_direction;
+
+		if (dev->direction == SOF_IPC_STREAM_PLAYBACK) {
+			owner_pp = &npu_tap_out_owner;
+			tap_phys = NPU_TAP_OUT_PHYS_ADDR;
+			hdr_direction = 0;
+		} else {
+			owner_pp = &npu_tap_in_owner;
+			tap_phys = NPU_TAP_IN_PHYS_ADDR;
+			hdr_direction = 1;
+		}
+
+		if (!*owner_pp) {
+			*owner_pp = dd;
+		} else if (*owner_pp != dd) {
 			comp_warn(dev,
 				  "NPU tap already owned by another DAI, this DAI disabled");
 			dd->tap_buffer = NULL;
@@ -699,9 +740,9 @@ int dai_common_params(struct dai_data *dd, struct comp_dev *dev,
 			dd->tap_period_bytes = 0;
 			goto skip_npu_tap_init;
 		}
-		/* npu_tap_owner == dd : first init or re-prepare (idempotent) */
+		/* owner == dd : first init or re-prepare (idempotent) */
 
-		dd->tap_buffer = (void *)(uintptr_t)NPU_TAP_PHYS_ADDR;
+		dd->tap_buffer = (void *)tap_phys;
 		dd->tap_buffer_size = NPU_TAP_RING_SIZE;
 		dd->tap_period_bytes = period_bytes;
 
@@ -731,6 +772,7 @@ int dai_common_params(struct dai_data *dd, struct comp_dev *dev,
 		hdr->sample_rate = 48000;
 		hdr->channels = 8;
 		hdr->frame_fmt = SOF_IPC_FRAME_S32_LE;
+		hdr->direction = hdr_direction;	/* 0=play, 1=cap */
 
 		/* Step 4 : flush data state (everything BEFORE epoch) */
 		dcache_writeback_region(
@@ -885,18 +927,20 @@ void dai_common_reset(struct dai_data *dd, struct comp_dev *dev)
 	struct dma_sg_config *config = &dd->config;
 
 	/*
-	 * V3.2.2 NPU tap (A1) — NULLify tap_buffer FIRST, before releasing DMA.
-	 * The hook in dai_dma_cb() checks dd->tap_buffer != NULL ; setting it
-	 * NULL here ensures any in-flight callback skips the memcpy_s and
+	 * V7.0-E4 NPU dual-tap (A1) — NULLify tap_buffer FIRST, before releasing
+	 * DMA. The hook in dai_dma_cb() checks dd->tap_buffer != NULL ; setting
+	 * it NULL here ensures any in-flight callback skips the memcpy_s and
 	 * doesn't write to a buffer about to be freed.
-	 * R7 — release the global ownership if we're the owner.
+	 * R7 — release ownership of the matching direction.
 	 */
 	dd->tap_buffer = NULL;
 	dd->tap_buffer_size = 0;
 	dd->tap_period_bytes = 0;
 	/* dd->tap_epoch is monotonic for the life of this dai_data — not reset */
-	if (npu_tap_owner == dd)
-		npu_tap_owner = NULL;
+	if (npu_tap_in_owner == dd)
+		npu_tap_in_owner = NULL;
+	if (npu_tap_out_owner == dd)
+		npu_tap_out_owner = NULL;
 
 	/*
 	 * DMA channel release should be skipped now for DAI's that support the two-step stop option.
