@@ -1643,8 +1643,12 @@ static int ipc_glb_tplg_pipe_trigger(uint32_t header)
 		{
 			volatile uint32_t *sai_base = (volatile uint32_t *)SAI_7_BASE;
 			static volatile uint32_t dbg_pre, dbg_start;
-			uint32_t tcsr = sai_base[0x00 / 4];
-			uint32_t rcsr = sai_base[0x80 / 4];
+			/* SAI_OFS=8 on i.MX8MP — see sof/src/include/sof/drivers/sai.h:21.
+			 * Without the +8 offset these reads hit VERID/garbage instead of
+			 * TCSR/RCSR, masking real SAI hardware state.
+			 */
+			uint32_t tcsr = sai_base[0x08 / 4];
+			uint32_t rcsr = sai_base[0x88 / 4];
 			if (msg.cmd == 7) {
 				dbg_pre++;
 				mailbox_sw_reg_write(0x7B0, tcsr);
