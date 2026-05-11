@@ -480,7 +480,19 @@ static inline int sai_set_config(struct dai *dai, struct ipc_config_dai *common_
 	 */
 	dai_update_bits(dai, REG_SAI_XCR3(REG_TX_DIR),
 			REG_SAI_CR3_TRCE_MASK, REG_SAI_CR3_TRCE(1));
-	dai_write(dai, REG_SAI_TDR0, 0x0);
+	/* V7.0-E7.2 TX FIFO alignment fix : prime N zeros (= 1 full TDM frame)
+	 * BEFORE TERE=1 so the SAI starts with one frame of silent data already
+	 * in the FIFO. This guarantees the read pointer R is aligned with FSYNC
+	 * slot 0 at first frame edge. The original 1-zero prime caused TX
+	 * underflow after slot 0 → unaligned R when DMA later supplied data via
+	 * FRDE rise at first play_start → permanent 1-slot decalage on TDM TX.
+	 * Empirically observed slot 0=ch0 OK, slot 1=ch7, slots 2..7 silent.
+	 */
+	{
+		int i_prime;
+		for (i_prime = 0; i_prime < sai->params.tdm_slots; i_prime++)
+			dai_write(dai, REG_SAI_TDR0, 0x0);
+	}
 	dai_update_bits(dai, REG_SAI_XCSR(DAI_DIR_PLAYBACK),
 			REG_SAI_CSR_TERE, REG_SAI_CSR_TERE);
 	dai_update_bits(dai, REG_SAI_MCTL, REG_SAI_MCTL_MCLK_EN,
