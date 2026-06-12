@@ -11,6 +11,7 @@
 #include <rtos/timer.h>
 #include <rtos/alloc.h>
 #include <sof/lib/cpu.h>
+#include <sof/lib/mailbox.h>
 #include <sof/lib/dma.h>
 #include <sof/platform.h>
 #include <sof/schedule/ll_schedule.h>
@@ -149,16 +150,45 @@ struct ll_schedule_domain *zephyr_dma_domain_init(struct dma *dma_array,
 	return domain;
 }
 
+/* V9.5.20 — DSP load : duty-cycle du traitement audio (busy/wall) publié
+ * dans les SW REGs mailbox (fenêtre DEBUG, lue par Linux via debugfs) :
+ *   0xE0 : charge en % (0-100), moyenne sur ~250 ms
+ *   0xE4 : heartbeat (incrémenté à chaque rapport ; figé = pipelines stoppés)
+ * Additif pur — ne modifie ni le scheduling DMA ni les pipelines. */
+#define DSP_LOAD_SW_REG_PCT	0xE0
+#define DSP_LOAD_SW_REG_BEAT	0xE4
+
 static void zephyr_dma_domain_thread_fn(void *p1, void *p2, void *p3)
 {
 	struct zephyr_dma_domain_thread *dt = p1;
+	uint32_t busy_cycles = 0;
+	uint32_t win_start = k_cycle_get_32();
+	uint32_t beat = 0;
+	/* fenêtre de rapport ~250 ms en cycles timer */
+	const uint32_t report_win = sys_clock_hw_cycles_per_sec() / 4;
 
 	while (true) {
 		/* wait for DMA IRQ */
 		k_sem_take(&dt->sem, K_FOREVER);
 
 		/* do work */
+		uint32_t t0 = k_cycle_get_32();
+
 		dt->handler(dt->arg);
+
+		uint32_t t1 = k_cycle_get_32();
+
+		busy_cycles += t1 - t0;	/* wrap-safe (uint32) */
+
+		uint32_t wall = t1 - win_start;
+
+		if (wall >= report_win) {
+			mailbox_sw_reg_write(DSP_LOAD_SW_REG_PCT,
+					     busy_cycles * 100ULL / wall);
+			mailbox_sw_reg_write(DSP_LOAD_SW_REG_BEAT, ++beat);
+			busy_cycles = 0;
+			win_start = t1;
+		}
 	}
 }
 
