@@ -129,31 +129,59 @@ static int multiband_drc_init_coef(struct processing_module *mod, int16_t nch, u
 	 * trailing_bytes = total - fixed_header. Must be divisible by
 	 * (num_bands * sizeof(sof_drc_params)) ; quotient = params_per_band.
 	 * params_per_band == 1 => legacy ; > 1 => per-channel-per-band (V7.0).
+	 *
+	 * V10-FX (blob V3) : une section OPTIONNELLE de crossover par canal
+	 * peut suivre drc_coef : params_per_band blocs de
+	 * SOF_CROSSOVER_MAX_LR4 biquads. Détection par taille :
+	 *   trailing == ppb × (num_bands×88 + 6×28)  → V3 (xover par canal)
+	 *   trailing == ppb × (num_bands×88)         → V2 (xover global)
+	 * (non ambigu pour nos géométries 2..4 bandes × 2..8 canaux)
 	 */
 	{
 		size_t trailing = config->size - SOF_MULTIBAND_DRC_HEADER_FIXED_SIZE;
 		size_t one_band = num_bands * sizeof(struct sof_drc_params);
+		size_t one_band_x = one_band +
+			SOF_CROSSOVER_MAX_LR4 * sizeof(struct sof_eq_iir_biquad);
 
-		if (one_band == 0 || (trailing % one_band) != 0) {
+		cd->xover_per_ch = 0;
+		cd->xover_base = NULL;
+		if (one_band && (trailing % one_band_x) == 0 &&
+		    trailing / one_band_x > 1 &&
+		    trailing / one_band_x <= PLATFORM_MAX_CHANNELS) {
+			cd->params_per_band = (uint32_t)(trailing / one_band_x);
+			cd->xover_per_ch = 1;
+			cd->xover_base = (struct sof_eq_iir_biquad *)
+				((uint8_t *)config->drc_coef +
+				 (size_t)num_bands * cd->params_per_band *
+				 sizeof(struct sof_drc_params));
+		} else if (one_band && (trailing % one_band) == 0 &&
+			   trailing / one_band >= 1 &&
+			   trailing / one_band <= PLATFORM_MAX_CHANNELS) {
+			cd->params_per_band = (uint32_t)(trailing / one_band);
+		} else {
 			comp_err(dev,
 				 "multiband_drc_init_coef(), bad blob size %u — trailing %zu not multiple of %zu (legacy fallback)",
 				 config->size, trailing, one_band);
 			cd->params_per_band = 1;
-		} else {
-			cd->params_per_band = (uint32_t)(trailing / one_band);
 		}
 		comp_info(dev,
-			  "multiband_drc_init_coef(), %s params_per_band=%u (num_bands=%i nch=%i)",
-			  cd->params_per_band == 1 ? "legacy" : "V7.0 per-channel",
-			  cd->params_per_band, num_bands, nch);
+			  "multiband_drc_init_coef(), params_per_band=%u xover_per_ch=%u (num_bands=%i nch=%i)",
+			  cd->params_per_band, cd->xover_per_ch, num_bands, nch);
 	}
 
 	comp_info(dev, "multiband_drc_init_coef(), initializing %i-way crossover",
 		  config->num_bands);
 
-	/* Crossover: collect the coef array and assign it to every channel */
-	crossover = config->crossover_coef;
+	/* Crossover : coefs par canal (blob V3) sinon le jeu global.
+	 * Canal ch au-delà de params_per_band : clamp sur le dernier bloc
+	 * (même dégradation gracieuse que DRC_PARAM_FOR_CH). */
 	for (ch = 0; ch < nch; ch++) {
+		crossover = config->crossover_coef;
+		if (cd->xover_per_ch) {
+			uint32_t xch = ch < cd->params_per_band
+				       ? (uint32_t)ch : cd->params_per_band - 1;
+			crossover = cd->xover_base + xch * SOF_CROSSOVER_MAX_LR4;
+		}
 		ret = crossover_init_coef_ch(crossover, &state->crossover[ch],
 					     config->num_bands);
 		/* Free all previously allocated blocks in case of an error */
@@ -360,6 +388,38 @@ static int multiband_drc_process(struct processing_module *mod,
 		if (ret < 0) {
 			comp_err(dev, "multiband_drc_process(), failed DRC setup");
 			return ret;
+		}
+	}
+
+	/* V10-FX : bypass BIT-TRANSPARENT quand tous les canaux de toutes les
+	 * bandes sont OFF — sinon la chaîne emphasis→crossover→somme→deemphasis
+	 * reste dans le chemin et colore le signal effet « coupé » (constat
+	 * utilisateur : bouger XOVER modifiait le son avec tout OFF).
+	 * Coût : ≤ 32 lectures int par période 2 ms. NB : le passthrough
+	 * supprime aussi le pre-delay du DRC (pre_delay=0 dans nos blobs). */
+	if (cd->config && cd->process_enabled) {
+		const struct sof_drc_params *dp = cd->config->drc_coef;
+		uint32_t nprm = cd->config->num_bands * cd->params_per_band;
+		uint32_t k;
+		bool any_enabled = false;
+
+		for (k = 0; k < nprm; k++) {
+			if (dp[k].enabled) {
+				any_enabled = true;
+				break;
+			}
+		}
+		if (!any_enabled) {
+			multiband_drc_func pass =
+				multiband_drc_find_proc_func_pass(cd->source_format);
+
+			if (pass) {
+				pass(mod, source, sink, frames);
+				module_update_buffer_position(&input_buffers[0],
+							      &output_buffers[0],
+							      frames);
+				return 0;
+			}
 		}
 	}
 

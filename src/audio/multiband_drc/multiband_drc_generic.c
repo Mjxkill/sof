@@ -76,13 +76,16 @@ static void multiband_drc_s16_process_drc(struct drc_state *state,
 	int pd_read_index;
 	const struct sof_drc_params *p;
 
-	if (p_band_base[0].enabled && !state->processed) {
-		for (ch = 0; ch < nch; ++ch) {
-			p = DRC_PARAM_FOR_CH(p_band_base, params_per_band, ch);
-			drc_update_envelope(state, p, ch);
-			drc_compress_output(state, p, 2, ch);
-		}
-		state->processed = 1;
+	/* V10-FX : priming PAR CANAL — state->processed devient un bitmask
+	 * (bit ch), seuls les canaux enabled sont amorcés. Un canal (ré)activé
+	 * en cours de route est amorcé à la division suivante. */
+	for (ch = 0; ch < nch; ++ch) {
+		p = DRC_PARAM_FOR_CH(p_band_base, params_per_band, ch);
+		if (!p->enabled || (state->processed & (1u << ch)))
+			continue;
+		drc_update_envelope(state, p, ch);
+		drc_compress_output(state, p, 2, ch);
+		state->processed |= 1u << ch;
 	}
 
 	pd_write_index = state->pre_delay_write_index;
@@ -103,14 +106,14 @@ static void multiband_drc_s16_process_drc(struct drc_state *state,
 	state->pre_delay_write_index = pd_write_index;
 	state->pre_delay_read_index = pd_read_index;
 
-	/* enabled flag treated as band-global (taken from ch 0). */
-	if (!p_band_base[0].enabled)
-		return;
-
-	/* Process the input division (32 frames) per channel. */
+	/* V10-FX : enabled PAR CANAL (avant : band-global lu sur ch0) — un
+	 * canal OFF garde son délai (alignement inter-canaux) mais aucun gain
+	 * n'est calculé ni appliqué pour lui : passthrough retardé. */
 	if (!(pd_write_index & DRC_DIVISION_FRAMES_MASK)) {
 		for (ch = 0; ch < nch; ++ch) {
 			p = DRC_PARAM_FOR_CH(p_band_base, params_per_band, ch);
+			if (!p->enabled)
+				continue;
 			drc_update_detector_average(state, p, 2, ch);
 			drc_update_envelope(state, p, ch);
 			drc_compress_output(state, p, 2, ch);
@@ -134,13 +137,15 @@ static void multiband_drc_s32_process_drc(struct drc_state *state,
 	int pd_read_index;
 	const struct sof_drc_params *p;
 
-	if (p_band_base[0].enabled && !state->processed) {
-		for (ch = 0; ch < nch; ++ch) {
-			p = DRC_PARAM_FOR_CH(p_band_base, params_per_band, ch);
-			drc_update_envelope(state, p, ch);
-			drc_compress_output(state, p, 4, ch);
-		}
-		state->processed = 1;
+	/* V10-FX : priming PAR CANAL — state->processed devient un bitmask
+	 * (bit ch), seuls les canaux enabled sont amorcés. */
+	for (ch = 0; ch < nch; ++ch) {
+		p = DRC_PARAM_FOR_CH(p_band_base, params_per_band, ch);
+		if (!p->enabled || (state->processed & (1u << ch)))
+			continue;
+		drc_update_envelope(state, p, ch);
+		drc_compress_output(state, p, 4, ch);
+		state->processed |= 1u << ch;
 	}
 
 	pd_write_index = state->pre_delay_write_index;
@@ -161,14 +166,14 @@ static void multiband_drc_s32_process_drc(struct drc_state *state,
 	state->pre_delay_write_index = pd_write_index;
 	state->pre_delay_read_index = pd_read_index;
 
-	/* enabled flag treated as band-global (taken from ch 0). */
-	if (!p_band_base[0].enabled)
-		return;
-
-	/* Process the input division (32 frames) per channel. */
+	/* V10-FX : enabled PAR CANAL (avant : band-global lu sur ch0) — un
+	 * canal OFF garde son délai (alignement inter-canaux) mais aucun gain
+	 * n'est calculé ni appliqué pour lui : passthrough retardé. */
 	if (!(pd_write_index & DRC_DIVISION_FRAMES_MASK)) {
 		for (ch = 0; ch < nch; ++ch) {
 			p = DRC_PARAM_FOR_CH(p_band_base, params_per_band, ch);
+			if (!p->enabled)
+				continue;
 			drc_update_detector_average(state, p, 4, ch);
 			drc_update_envelope(state, p, ch);
 			drc_compress_output(state, p, 4, ch);

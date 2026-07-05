@@ -31,8 +31,14 @@
  *                                      = 2816 B
  *   total max ≈ 3060 B (4 bands × 8 ch).
  * Old limit 1024 B kept legacy single-config (4 bands × 1 ch × 88 ≈ 352 B + 244 hdr).
+ *
+ * V10-FX (blob V3) : + section OPTIONNELLE crossover PAR CANAL après
+ * drc_coef : params_per_band × SOF_CROSSOVER_MAX_LR4 biquads (8 ch → 1344 B).
+ * Détection par arithmétique de taille (cf. multiband_drc_init_coef).
+ * Total max ≈ 4404 B (4 bandes × 8 ch + xover/ch) → bump 6144.
+ * CONTROLBYTES_MAX des topologies aligné (pipe-multiband-drc-pga-8ch-*.m4).
  */
-#define SOF_MULTIBAND_DRC_MAX_BLOB_SIZE 4096
+#define SOF_MULTIBAND_DRC_MAX_BLOB_SIZE 6144
 
  /* multiband_drc configuration
   *     Multiband DRC is a single-source-single-sink compound component which

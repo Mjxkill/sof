@@ -39,7 +39,7 @@ C_CONTROLBYTES(MULTIBAND_DRC_OUT_8CH_CTRL, PIPELINE_ID,
 		258 binds the control to bytes get/put handlers,
 		258, 258),
 	, , ,
-	CONTROLBYTES_MAX(, 4096),
+	CONTROLBYTES_MAX(, 6144),
 	,
 	MULTIBAND_DRC_priv_8ch)
 

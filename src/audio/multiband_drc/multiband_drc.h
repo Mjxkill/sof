@@ -48,6 +48,11 @@ struct multiband_drc_comp_data {
 						   *   (typically N = num_channels for V7.0-E2).
 						   *   Computed at config load from blob size.
 						   */
+	uint32_t xover_per_ch;                   /**< V10-FX : 1 si le blob V3 porte une
+						   *   section crossover PAR CANAL après
+						   *   drc_coef (params_per_band blocs de
+						   *   SOF_CROSSOVER_MAX_LR4 biquads) */
+	struct sof_eq_iir_biquad *xover_base;    /**< base de la section V3 (dans config) */
 };
 
 struct multiband_drc_proc_fnmap {
